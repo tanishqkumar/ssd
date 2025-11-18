@@ -7,11 +7,11 @@ from transformers import AutoTokenizer
 
 # Dataset file paths on local system
 DATASET_PATHS = {
-    "humaneval": "/data/tkumar/huggingface//processed_datasets/humaneval/humaneval_data_10000.jsonl",
-    "alpaca": "/data/tkumar/huggingface//processed_datasets/alpaca/alpaca_data_10000.jsonl",
-    "c4": "/data/tkumar/huggingface//processed_datasets/c4/c4_data_10000.jsonl",
-    "gsm": "/data/tkumar/huggingface//processed_datasets/gsm8k/gsm8k_data_10000.jsonl",
-    "ultrafeedback": "/data/tkumar/huggingface//processed_datasets/ultrafeedback/ultrafeedback_data_10000.jsonl",
+    "humaneval": "/data/tkumar/huggingface/processed_datasets/humaneval/humaneval_data_10000.jsonl",
+    "alpaca": "/data/tkumar/huggingface/processed_datasets/alpaca/alpaca_data_10000.jsonl",
+    "c4": "/data/tkumar/huggingface/processed_datasets/c4/c4_data_10000.jsonl",
+    "gsm": "/data/tkumar/huggingface/processed_datasets/gsm8k/gsm8k_data_10000.jsonl",
+    "ultrafeedback": "/data/tkumar/huggingface/processed_datasets/ultrafeedback/ultrafeedback_data_10000.jsonl",
 }
 
 
@@ -42,13 +42,31 @@ def _get_snapshot_path(base_path: str) -> str:
             if os.path.isdir(item_path) and os.path.exists(os.path.join(item_path, "config.json")):
                 return item_path
 
-    raise FileNotFoundError(f"No snapshot (config.json) found under {base_path}")
+    raise FileNotFoundError(
+        f"No snapshot (config.json) found under {base_path}")
 
 
 def _get_draft_model_path(args, cache_dir: str) -> str:
     """Get draft model path based on size or explicit directory."""
-    if os.path.isdir(args.draft):
+    if args.draft is not None and os.path.isdir(args.draft):
         return args.draft
+    
+    # Handle EAGLE auto-selection
+    if getattr(args, "eagle", False):
+        if args.llama:
+            # Map target model size to corresponding EAGLE draft
+            if args.size == "8":
+                return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B")
+            elif args.size == "70":
+                return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.3-Instruct-70B")
+            else:
+                raise ValueError(f"EAGLE draft not available for Llama size {args.size}")
+        else:
+            # Qwen
+            if args.size == "32":
+                return os.path.join(cache_dir, "models--RedHatAI--Qwen3-32B-speculator.eagle3")
+            else:
+                raise ValueError(f"EAGLE draft not available for Qwen size {args.size}")
 
     if args.llama:
         draft_size_to_model = {
@@ -93,8 +111,10 @@ def get_model_paths(args, cache_dir: str = "/data/tkumar/huggingface/hub/") -> T
                 f"Size {args.size} not available for Llama models. Available sizes: {list(size_to_model.keys())}"
             )
         model_name = size_to_model[args.size]
-        model_base = os.path.join(cache_dir, f"models--meta-llama--{model_name}")
-        default_draft_base = os.path.join(cache_dir, "models--meta-llama--Llama-3.2-1B-Instruct")
+        model_base = os.path.join(
+            cache_dir, f"models--meta-llama--{model_name}")
+        default_draft_base = os.path.join(
+            cache_dir, "models--meta-llama--Llama-3.2-1B-Instruct")
     else:
         size_to_model = {
             "0.6": "Qwen3-0.6B",
@@ -110,12 +130,17 @@ def get_model_paths(args, cache_dir: str = "/data/tkumar/huggingface/hub/") -> T
             )
         model_name = size_to_model[args.size]
         model_base = os.path.join(cache_dir, f"models--Qwen--{model_name}")
-        default_draft_base = os.path.join(cache_dir, "models--Qwen--Qwen3-0.6B")
+        default_draft_base = os.path.join(
+            cache_dir, "models--Qwen--Qwen3-0.6B")
 
     model_path = _get_snapshot_path(model_base)
 
     # Always resolve a draft path so callers can pass it through unchanged
-    draft_base = _get_draft_model_path(args, cache_dir) if getattr(args, "draft", None) else default_draft_base
+    if getattr(args, "eagle", False) or getattr(args, "draft", None):
+         draft_base = _get_draft_model_path(args, cache_dir)
+    else:
+         draft_base = default_draft_base
+         
     draft_path = _get_snapshot_path(draft_base)
 
     return model_name, model_path, draft_path
@@ -132,12 +157,14 @@ def load_dataset_token_ids(
     target_len = max(len(text_tokens), input_len)
     """
     if dataset_name not in DATASET_PATHS:
-        print(f"Warning: Unknown dataset {dataset_name}, falling back to random tokens")
+        print(
+            f"Warning: Unknown dataset {dataset_name}, falling back to random tokens")
         return None
 
     dataset_file_path = DATASET_PATHS[dataset_name]
     if not os.path.exists(dataset_file_path):
-        print(f"Warning: Dataset file not found at {dataset_file_path}, falling back to random tokens")
+        print(
+            f"Warning: Dataset file not found at {dataset_file_path}, falling back to random tokens")
         return None
 
     try:
@@ -158,7 +185,8 @@ def load_dataset_token_ids(
                 prompts.append(truncated_tokens)
         return prompts
     except Exception as e:
-        print(f"Warning: Error loading {dataset_name} prompts: {e}, falling back to random tokens")
+        print(
+            f"Warning: Error loading {dataset_name} prompts: {e}, falling back to random tokens")
         return None
 
 
@@ -172,13 +200,17 @@ def load_all_dataset_token_ids(
     all_prompts: List[List[int]] = []
 
     for dataset_name in datasets:
-        print(f"Loading {num_prompts_per_dataset} prompts from {dataset_name}...")
-        dataset_prompts = load_dataset_token_ids(dataset_name, model_path, num_prompts_per_dataset, input_len)
+        print(
+            f"Loading {num_prompts_per_dataset} prompts from {dataset_name}...")
+        dataset_prompts = load_dataset_token_ids(
+            dataset_name, model_path, num_prompts_per_dataset, input_len)
         if dataset_prompts is not None:
             all_prompts.extend(dataset_prompts)
         else:
-            print(f"Failed to load {dataset_name}, adding random tokens instead")
-            random_prompts = [[randint(0, 10000) for _ in range(input_len)] for _ in range(num_prompts_per_dataset)]
+            print(
+                f"Failed to load {dataset_name}, adding random tokens instead")
+            random_prompts = [[randint(0, 10000) for _ in range(
+                input_len)] for _ in range(num_prompts_per_dataset)]
             all_prompts.extend(random_prompts)
 
     print(f"Total prompts loaded: {len(all_prompts)}")
@@ -223,14 +255,17 @@ def generate_benchmark_inputs(
         return string_prompts, None, selected_prompts
 
     if getattr(args, "random", False):
-        prompt_token_ids = [[randint(0, 10000) for _ in range(args.input_len)] for _ in range(args.numseqs)]
+        prompt_token_ids = [[randint(0, 10000) for _ in range(
+            args.input_len)] for _ in range(args.numseqs)]
         return None, prompt_token_ids, None
 
     if getattr(args, "all", False):
-        token_ids = load_all_dataset_token_ids(model_path, args.numseqs, args.input_len)
+        token_ids = load_all_dataset_token_ids(
+            model_path, args.numseqs, args.input_len)
         if not token_ids:
             print("Warning: All dataset loading failed, falling back to random tokens")
-            token_ids = [[randint(0, 10000) for _ in range(args.input_len)] for _ in range(args.numseqs * 4)]
+            token_ids = [[randint(0, 10000) for _ in range(
+                args.input_len)] for _ in range(args.numseqs * 4)]
         return None, token_ids, None
 
     # Single dataset case
@@ -245,11 +280,11 @@ def generate_benchmark_inputs(
     else:
         dataset_name = "gsm"
 
-    dataset_prompts = load_dataset_token_ids(dataset_name, model_path, args.numseqs, args.input_len)
+    dataset_prompts = load_dataset_token_ids(
+        dataset_name, model_path, args.numseqs, args.input_len)
     if dataset_prompts is None:
-        token_ids = [[randint(0, 10000) for _ in range(args.input_len)] for _ in range(args.numseqs)]
+        token_ids = [[randint(0, 10000) for _ in range(args.input_len)]
+                     for _ in range(args.numseqs)]
     else:
         token_ids = dataset_prompts
     return None, token_ids, None
-
-
