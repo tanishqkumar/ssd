@@ -28,6 +28,7 @@ def parse_arguments():
     
     # Speculative decoding configuration
     parser.add_argument("--spec", action="store_true", help="Enable speculative decoding")
+    parser.add_argument("--eagle", action="store_true", help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model)")
     parser.add_argument("--k", type=int, default=1, help="Speculative decoding k value")
     parser.add_argument("--async", action="store_true", help="Enable async speculative decoding")
     parser.add_argument("--f", type=int, default=3, help="Async fan out value")
@@ -67,7 +68,14 @@ def parse_arguments():
     parser.add_argument("--group", type=str, default=None, help="Wandb group name")
     parser.add_argument("--name", type=str, default=None, help="Wandb run name")
     
-    return parser.parse_args()
+    # Handle eagle implication
+    args = parser.parse_args()
+    if args.eagle:
+        args.spec = True
+        assert args.llama, "Eagle currently only supports llama models"
+        assert args.temp == 0.0 and args.dtemp is None and args.ttemp is None, "Eagle currently only supports greedy decoding (temp=0)"
+        assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
+    return args
 
 
 
@@ -295,6 +303,9 @@ def main():
     
     # Create LLM
     llm_kwargs = create_llm_kwargs(args, draft_path)
+    if args.eagle:
+        llm_kwargs['use_eagle'] = True
+        
     llm = LLM(model_path, **llm_kwargs)
     
     try:

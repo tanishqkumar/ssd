@@ -276,6 +276,7 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config, 
         draft: bool = False,
         speculate: bool = False,
+        use_eagle: bool = False,
         spec_k: int = 1,
         async_fan_out: int = 1, 
         draft_async: bool = False,
@@ -290,6 +291,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.tp_group = tp_group
         self.tp_size = tp_size
         
+        assert not use_eagle, "ERROR in Qwen3ForCausalLM: use_eagle not supported for Qwen3"
         assert not (tp_group is None and self.tp_size > 1), "ERROR in Qwen3ForCausalLM: tp_group is None and tp_size > 1"
 
         print(f'Starting Qwen3ForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
