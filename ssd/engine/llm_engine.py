@@ -3,6 +3,7 @@ os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0'  # for FlashInfer
 from ssd.engine.helpers.handshake_helpers import TargetDraftHandshake
 from ssd.config import Config
 from ssd.sampling_params import SamplingParams
+from ssd.utils.misc import infer_model_family
 from ssd.engine.sequence import Sequence
 from ssd.engine.helpers.debug_helpers import _compare_kv_caches_debug, sleep_for_small_target_debug, _compare_logits_and_save_state_debug
 from ssd.engine.scheduler import Scheduler
@@ -46,6 +47,12 @@ class LLMEngine:
         assert config.kvcache_block_size >= (
             2 * config.speculate_k + 2), "ERROR: support for block size < 2*k+2 is not implemented"
         assert config.num_gpus > 1 or not config.draft_async, "ERROR: draft_async requires at least 2 gpus"
+            
+        # Check that target and draft are from the same family
+        if config.speculate:
+            target_family = infer_model_family(config.model)
+            draft_family = infer_model_family(config.draft)
+            assert target_family == draft_family, f"ERROR: target model family and draft model family must match"
 
         self.ps = []
         self.events = []

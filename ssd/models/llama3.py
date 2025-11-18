@@ -21,9 +21,8 @@ class LlamaAttention(nn.Module):  # Renamed from Qwen3Attention
         max_position: int = 4096 * 32,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
-        rope_theta: float = 500000,  # Llama 3.1 uses 500000 instead of 10000
+        rope_theta: float = 500000,
         rope_scaling: dict | None = None,
-        # speculation args 
         draft: bool = False,
         speculate: bool = False,
         spec_k: int = 1,
@@ -46,7 +45,7 @@ class LlamaAttention(nn.Module):  # Renamed from Qwen3Attention
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-
+        
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -63,7 +62,6 @@ class LlamaAttention(nn.Module):  # Renamed from Qwen3Attention
             tp_group=self.tp_group,
             tp_size=self.tp_size,
         )
-        # print(f'self.o_proj.weight.shape: {self.o_proj.weight.shape}') # [2048, 2048]
         
         # Llama 3 doesn't use rope scaling but 3.1 does (and Qwen3 does) -- this only makes a difference on long context prompts, which we don't test 
         if rope_scaling is not None:
@@ -141,7 +139,7 @@ class LlamaDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,  # Changed from Qwen3Config
+        config: LlamaConfig,
         draft: bool,
         speculate: bool,
         spec_k: int,
@@ -156,14 +154,14 @@ class LlamaDecoderLayer(nn.Module):
         self.spec_k = spec_k
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
-        self.self_attn = LlamaAttention(  # Changed from Qwen3Attention
+        self.self_attn = LlamaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 500000),  # Llama default
+            rope_theta=getattr(config, "rope_theta", 500000),
             rope_scaling=getattr(config, "rope_scaling", None),
             draft=self.draft,
             speculate=self.speculate,
@@ -181,6 +179,7 @@ class LlamaDecoderLayer(nn.Module):
             tp_group=tp_group,
             tp_size=tp_size,
         )
+
         self.input_layernorm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -205,12 +204,14 @@ class LlamaModel(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,  # Changed from Qwen3Config
+        config: LlamaConfig,
         draft: bool = False,
         speculate: bool = False,
         spec_k: int = 1,
         async_fan_out: int = 1,
         draft_async: bool = False,
+        use_eagle: bool = False,
+        eagle_layers: list[int] | None = None,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
     ) -> None:
@@ -220,6 +221,8 @@ class LlamaModel(nn.Module):
         self.spec_k = spec_k
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
+        self.use_eagle = use_eagle
+        self.eagle_layers = eagle_layers
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -246,13 +249,25 @@ class LlamaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.embed_tokens(input_ids)  # torch.Size([4096, 2560]) always through residual stream 
         residual = None
-        for layer in self.layers:
+        
+        # Collect activations if use_eagle
+        collected_acts = [] if self.use_eagle else None
+        
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+            
+            if collected_acts is not None: collected_acts.append(hidden_states)
+        
+        hidden_states, _ = self.norm(hidden_states, residual) 
+        
+        if collected_acts:
+            eagle_acts = torch.cat(collected_acts, dim=-1)
+            return hidden_states, eagle_acts
+        else:
+            return hidden_states
 
 
 class LlamaForCausalLM(nn.Module):
@@ -269,6 +284,8 @@ class LlamaForCausalLM(nn.Module):
         config: LlamaConfig,  # Changed from Qwen3Config
         draft: bool = False,
         speculate: bool = False,
+        use_eagle: bool = False,
+        eagle_layers: list[int] | None = None,
         spec_k: int = 1,
         async_fan_out: int = 1,
         draft_async: bool = False,
@@ -281,13 +298,16 @@ class LlamaForCausalLM(nn.Module):
         self.draft = draft
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
+        self.use_eagle = use_eagle
+        self.eagle_layers = eagle_layers
         self.tp_group = tp_group
         self.tp_size = tp_size
         
+        assert not (use_eagle and draft), "ERROR in LlamaForCausalLM: use_eagle should be on EagleDraftForCausalLM and not LlamaForCausalLM"
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
 
         print(f'Starting LlamaForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
-        self.model = LlamaModel(config, draft, speculate, spec_k, async_fan_out, draft_async, tp_group=tp_group, tp_size=self.tp_size)
+        self.model = LlamaModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, tp_group=tp_group, tp_size=self.tp_size)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -303,9 +323,10 @@ class LlamaForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
-        return hidden_states
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        out = self.model(input_ids, positions)
+        return out
+
 
     def compute_logits(
         self,

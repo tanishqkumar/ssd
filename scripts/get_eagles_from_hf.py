@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Script to download Llama 3.1 and 3.2 models from Hugging Face Hub.
+Script to download EAGLE3 draft models from Hugging Face Hub.
 """
 
 import os
 from huggingface_hub import snapshot_download
 
 
-def download_llama_models():
-    """Download Llama 3.1 and 3.2 models to hub directory structure."""
+def download_eagle_models():
+    """Download EAGLE3 draft models to hub directory structure."""
 
     # Define models to download
     models = [
-        # "meta-llama/Llama-3.1-8B-Instruct",
-        "meta-llama/Llama-3.3-70B-Instruct",
-        # "meta-llama/Llama-3.1-70B-Instruct",
-        # "meta-llama/Llama-3.2-1B-Instruct",
-        # "meta-llama/Llama-3.2-3B-Instruct"
+        "yuhuili/EAGLE3-LLaMA3.3-Instruct-70B",
+        "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+        "RedHatAI/Qwen3-32B-speculator.eagle3"
     ]
 
     # Set cache directory to the specified target location
@@ -36,8 +34,8 @@ def download_llama_models():
             print(f"✗ Failed to download {model_name}: {e}")
 
     print("\nDownload complete! Models are stored in:")
-    print(f"{cache_dir}/models--meta-llama--Llama-<version>-<size>/snapshots/<hash>/")
+    print(f"{cache_dir}/models--<org>--<model>/snapshots/<hash>/")
 
 
 if __name__ == "__main__":
-    download_llama_models()
+    download_eagle_models()

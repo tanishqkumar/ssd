@@ -12,6 +12,7 @@ from ssd.config import Config
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
 from ssd.models.llama3 import LlamaForCausalLM
+from ssd.models.eagle3_draft_llama3 import Eagle3DraftForCausalLM
 from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
@@ -40,13 +41,16 @@ class ModelRunner:
         assert is_draft in [True, False], "ERROR in ModelRunner: is_draft must be True or False"
         self.is_draft = is_draft
         if self.is_draft: 
-            assert config.draft_hf_config.torch_dtype == config.hf_config.torch_dtype, "ERROR in ModelRunner: draft_hf_config.torch_dtype != hf_config.torch_dtype"
-            assert config.draft_hf_config.vocab_size == config.hf_config.vocab_size, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
+            if config.draft_hf_config.torch_dtype != config.hf_config.torch_dtype:
+                if self.verbose:
+                    print(f"Warning: Draft dtype {config.draft_hf_config.torch_dtype} differs from target {config.hf_config.torch_dtype}. Casting draft to {config.hf_config.torch_dtype}.")
+                config.draft_hf_config.torch_dtype = config.hf_config.torch_dtype
+            assert (config.draft_hf_config.vocab_size == config.hf_config.vocab_size) or config.use_eagle, "ERROR in ModelRunner: draft_hf_config.vocab_size != hf_config.vocab_size"
         
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True)
         self.max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
         assert self.hf_config is not None, "ERROR in ModelRunner: hf_config is None" # this implies boundedness to the end 
@@ -82,51 +86,7 @@ class ModelRunner:
         
         # cudagraph logic for FlashInfer kernels, need diff wrapper for each batch size we make a graph for 
         if is_draft and config.draft_async:
-            self.workspace_buffer = torch.zeros(
-                512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}") 
-            if self.config.enforce_eager: 
-                self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
-            else: 
-                max_bs = min(self.config.max_num_seqs, 512)
-                max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
-                
-                # FlashInfer kernel tensors
-                # pages_for_max_len = (self.config.max_model_len + self.block_size - 1) // self.block_size
-                last_page_len_max_len = self.config.max_model_len % self.block_size
-                last_page_len_max_len = self.block_size if last_page_len_max_len == 0 else last_page_len_max_len
-                MQ_LEN = self.config.async_fan_out * (self.config.speculate_k + 1)
-                
-                cu_seqlens_q = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-                kv_indptr = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-                kv_indices = torch.empty(max_bs * max_num_blocks, dtype=torch.int32, device=self.device)
-                kv_last_page_len = torch.empty(max_bs, dtype=torch.int32, device=self.device)
-                custom_mask_buf = torch.empty(max_bs * MQ_LEN * self.config.max_model_len, dtype=torch.uint8, device=self.device) # it was FUCKING THIS LASDKFJPAOSIDFJPASLDFJASDLF
-                mask_indptr_buf = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
-                
-                # Create graph_bs_list to match what will be used in cudagraph_helpers.py
-                graph_bs_list = [1]
-                for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
-                    if bs <= max_bs:
-                        graph_bs_list.append(bs)
-                if max_bs not in graph_bs_list:
-                    graph_bs_list.append(max_bs)
-                graph_bs_list.sort()
-                
-                # Create a dict of wrappers, one for each bs we will touch in cudagraph_helpers.py
-                self.prefill_wrappers = {}
-                print(f'[model_runner about to wrapper.init()] graph_bs_list={graph_bs_list}', flush=True)
-                for bs in graph_bs_list:
-                    self.prefill_wrappers[bs] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer, "NHD", 
-                        use_cuda_graph=True, 
-                        qo_indptr_buf=cu_seqlens_q[:bs + 1],
-                        paged_kv_indptr_buf=kv_indptr[:bs + 1],
-                        paged_kv_indices_buf=kv_indices[:bs * max_num_blocks],
-                        paged_kv_last_page_len_buf=kv_last_page_len[:bs],
-                        custom_mask_buf=custom_mask_buf[:bs * MQ_LEN * self.config.max_model_len],
-                        mask_indptr_buf=mask_indptr_buf[:bs + 1],
-                    )
-                print(f'wrapper backend is {self.prefill_wrappers[bs]._backend}', flush=True)
+            self._init_flashinfer_wrappers()
         
         if self.verbose: print(f'INSIDE MODEL RUNNER INIT, DRAFT={is_draft}', flush=True)
         self.tp_pg = None 
@@ -191,37 +151,75 @@ class ModelRunner:
                 
         if self.verbose: print(f'-----{model_type}MODEL RUNNER INITIALIZED----', flush=True)
 
+    def _init_flashinfer_wrappers(self):
+        """Initialize FlashInfer wrappers for draft async mode."""
+        self.workspace_buffer = torch.zeros(
+            512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}") 
+        
+        if self.config.enforce_eager: 
+            self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
+        else: 
+            max_bs = min(self.config.max_num_seqs, 512)
+            max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
+            
+            # FlashInfer kernel tensors
+            # pages_for_max_len = (self.config.max_model_len + self.block_size - 1) // self.block_size
+            last_page_len_max_len = self.config.max_model_len % self.block_size
+            last_page_len_max_len = self.block_size if last_page_len_max_len == 0 else last_page_len_max_len
+            MQ_LEN = self.config.async_fan_out * (self.config.speculate_k + 1)
+            
+            cu_seqlens_q = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
+            kv_indptr = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
+            kv_indices = torch.empty(max_bs * max_num_blocks, dtype=torch.int32, device=self.device)
+            kv_last_page_len = torch.empty(max_bs, dtype=torch.int32, device=self.device)
+            custom_mask_buf = torch.empty(max_bs * MQ_LEN * self.config.max_model_len, dtype=torch.uint8, device=self.device) # it was FUCKING THIS LASDKFJPAOSIDFJPASLDFJASDLF
+            mask_indptr_buf = torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
+            
+            # Create graph_bs_list to match what will be used in cudagraph_helpers.py
+            graph_bs_list = [1]
+            for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
+                if bs <= max_bs:
+                    graph_bs_list.append(bs)
+            if max_bs not in graph_bs_list:
+                graph_bs_list.append(max_bs)
+            graph_bs_list.sort()
+            
+            # Create a dict of wrappers, one for each bs we will touch in cudagraph_helpers.py
+            self.prefill_wrappers = {}
+            print(f'[model_runner about to wrapper.init()] graph_bs_list={graph_bs_list}', flush=True)
+            for bs in graph_bs_list:
+                self.prefill_wrappers[bs] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    self.workspace_buffer, "NHD", 
+                    use_cuda_graph=True, 
+                    qo_indptr_buf=cu_seqlens_q[:bs + 1],
+                    paged_kv_indptr_buf=kv_indptr[:bs + 1],
+                    paged_kv_indices_buf=kv_indices[:bs * max_num_blocks],
+                    paged_kv_last_page_len_buf=kv_last_page_len[:bs],
+                    custom_mask_buf=custom_mask_buf[:bs * MQ_LEN * self.config.max_model_len],
+                    mask_indptr_buf=mask_indptr_buf[:bs + 1],
+                )
+            print(f'wrapper backend is {self.prefill_wrappers[bs]._backend}', flush=True)
 
-    def setup_and_warmup_model_and_cudagraphs(self, config: Config, hf_config: AutoConfig, init_q= None, is_draft=False):
+    def setup_and_warmup_model_and_cudagraphs(self, config: Config, hf_config: AutoConfig, init_q=None, is_draft=False):
         # cudagraphs 
         self.graph_vars = {}
         self.graph_pools = {}
         self.graphs = {}
         self.graph_bs_list = {}
 
-        if hasattr(hf_config, 'model_type'):
-            if hf_config.model_type == 'llama':
-                model_class = LlamaForCausalLM
-            elif hf_config.model_type == 'qwen3':
-                model_class = Qwen3ForCausalLM
-            else:
-                raise ValueError(
-                    f"Unsupported model type: {hf_config.model_type}")
+        assert hasattr(hf_config, 'model_type'), "ERROR in ModelRunner: hf_config.model_type is not set"
+        if config.use_eagle and is_draft:
+            print(f'[EAGLE3] Loading Eagle3DraftForCausalLM as model_class', flush=True)
+            model_class = Eagle3DraftForCausalLM
+        elif hf_config.model_type == 'llama':
+            model_class = LlamaForCausalLM
+        elif hf_config.model_type == 'qwen3':
+            model_class = Qwen3ForCausalLM
         else:
-            # Fallback to detecting from model path
-            model_path = config.draft if is_draft else config.model
-            if 'llama' in model_path.lower():
-                model_class = LlamaForCausalLM
-                assert hf_config.vocab_size == 128256, "ERROR in ModelRunner: llama model must have vocab_size=32000"
-            elif 'qwen' in model_path.lower():
-                model_class = Qwen3ForCausalLM
-                assert hf_config.vocab_size == 151936, "ERROR in ModelRunner: qwen model must have vocab_size=32000"
-            else:
-                raise ValueError(
-                    f"Cannot determine model type from path: {model_path}")
+            raise ValueError(f"Unsupported model type: {hf_config.model_type}")
 
         # only give Qwen3 a tp_group if we're a TARGET runner
-        self.model = model_class(
+        kwargs = dict(
             config=self.hf_config,
             draft=self.is_draft,
             speculate=self.config.speculate,
@@ -231,13 +229,28 @@ class ModelRunner:
             tp_group=self.tp_pg,
             tp_size=self.num_tp_gpus,
         )
+        
+        if config.use_eagle:
+            kwargs['use_eagle'] = True
+            kwargs['eagle_layers'] = self.config.eagle_layers
+            
+        if model_class == Eagle3DraftForCausalLM:
+            # Eagle draft needs target d_model
+            # We can infer this from the target config if we had it, but here we are in draft runner
+            # Assuming Llama 3 8B target for now if not specified? 
+            # Actually, we should look at how Eagle3DraftForCausalLM uses d_model_target
+            # It uses it for the FC layer input: len(eagle_layers) * d_model_target
+            # We should probably pass this in config or infer it
+            # For now, let's assume standard Llama 3 hidden size if not provided
+            kwargs['d_model_target'] = config.d_model_target or 4096 # default to 4096 if not found
+            
+        self.model = model_class(**kwargs)
 
         model_type = "DRAFT " if self.is_draft else "TARGET "
         if self.verbose:
             print(f'-----LOADING {model_type}MODEL----', flush=True)
         load_model(self.model, config.model)
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
-            # dist.get_rank(group=async_pg) on draft will return 1 and on target will return 0
             self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
         if self.verbose:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
@@ -421,7 +434,14 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True) # prefill some empty seqs, them empty cache 
+        
+        hidden_states = None
+        if self.config.use_eagle and self.is_draft:
+            num_tokens = num_seqs * max_model_len
+            d_model_target = self.config.d_model_target or 4096
+            hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=torch.float16, device=self.device)
+        
+        self.run(seqs, True, hidden_states=hidden_states)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -570,21 +590,33 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None):
-        # eager/prefill path 
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None):
         is_tree_decode = self.is_draft and self.config.draft_async and tree_decode_step >= 0
         is_mq_kp1 = self.config.speculate and not last_only
         spec_and_dec = not is_prefill and self.config.speculate
 
         assert not (is_prefill and not last_only), "ERROR in run_model: is_prefill and not last_only"
         
-        if is_prefill or self.enforce_eager: # put tree decode on this path for now, will sort cudagraphs later 
-            # plan if tree decode, can assume context is already set and just get_context to create plan variables
+        if is_prefill or self.enforce_eager:
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
-            outputs = self.model(input_ids, positions)
-            logits = self.model.compute_logits(outputs, last_only)
-            return logits 
+            
+            if self.config.use_eagle: # TODO
+                if self.is_draft:
+                    assert hidden_states is not None, "hidden_states required for EAGLE draft"
+                    assert isinstance(self.model, Eagle3DraftForCausalLM)
+                    prenorm = self.model(input_ids, positions, hidden_states)
+                    logits = self.model.compute_logits(prenorm, last_only)
+                    return logits, prenorm  # return prenorm as conditioning vector for next iteration
+                else: # target gets outputs and hidden states
+                    outputs, eagle_acts = self.model(input_ids, positions) # target fwd when eagle enabled hooks into activations for eagle conditioning
+                    logits = self.model.compute_logits(outputs, last_only)
+                    return logits, eagle_acts  # return eagle_acts as conditioning vector for draft
+            else: 
+                outputs = self.model(input_ids, positions, hidden_states)
+                logits = self.model.compute_logits(outputs, last_only)
+                return logits 
+
         elif is_tree_decode: 
             return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits)
         elif is_mq_kp1: # verify or glue decode, draft or target, "verify" ~ mq decode of len K+1
@@ -594,19 +626,19 @@ class ModelRunner:
 
 
     # should add spec_k that just loops this k times
-    def run(self, seqs: list[Sequence], is_prefill: bool, last_only: bool = True, draft_return_logits: bool = False) -> list[int] | tuple[list[int], torch.Tensor]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, last_only: bool = True, draft_return_logits: bool = False, hidden_states: torch.Tensor | None = None) -> list[int] | tuple[list[int], torch.Tensor]:
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs, verify=not last_only) 
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill, last_only)
+        logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         
-        if last_only: # normal path, return tokens 
+        if last_only:
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             reset_context()
             return (token_ids, logits) if draft_return_logits else token_ids
-        else: # speculation path, will verify these logits
+        else:
             reset_context()
             return logits
     

@@ -21,7 +21,6 @@ class Config:
     # spec config args
     draft_hf_config: AutoConfig | None = None
     speculate: bool = False 
-    # draft: str = "/data/tkumar/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
     draft: str = "/data/tkumar/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
     speculate_k: int = 1
     draft_async: bool = False 
@@ -34,6 +33,13 @@ class Config:
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
     jit_speculate: bool = False 
+
+    # eagle3
+    use_eagle: bool = False 
+    eagle_layers: list[int] | None = None   
+    d_model_target: int | None = None
+    tokenizer_path: str | None = None
+
     
     device: torch.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     verbose: bool = False 
@@ -62,5 +68,10 @@ class Config:
                 if self.fan_out_list_miss is None:
                     self.fan_out_list_miss = self.fan_out_list 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
+                
+                if self.use_eagle: 
+                    if self.eagle_layers is None:
+                        L = self.hf_config.num_hidden_layers
+                        self.eagle_layers = [3, L//2, L-3]
         
         assert self.max_num_batched_tokens >= self.max_model_len
