@@ -404,7 +404,7 @@ class LLMEngine:
             
         return sum(len(s) for s in new_suffixes)
 
-    def async_draft_prefill_remote(self, seqs: list[Sequence]):
+    def async_draft_prefill_remote(self, seqs: list[Sequence], eagle_acts: torch.Tensor = None):
         # 1) build all the prefill payload in one shot
         input_ids, positions, cu_q, cu_k, max_q, max_k, slot_map = \
             prepare_prefill_tensors_from_seqs(
@@ -430,24 +430,33 @@ class LLMEngine:
             slot_map.size(0),
             max_q,
             max_k,
-            len(seqs)  # batch_size
+            len(seqs),  # batch_size
         ], dtype=torch.int64, device=self.config.device)
         dist.send(metadata, dst=self.num_tp_gpus,
                   group=self.model_runner.async_pg)
 
-        # 5) send each tensor in a fixed order -- TODO this needs to be packed at some point 
+        # 5) send each tensor in a fixed order
         for t in (input_ids, positions, cu_q, cu_k, slot_map, block_tables):
             dist.send(t, dst=self.num_tp_gpus,
                       group=self.model_runner.async_pg)
-        # (no recv—just fire‐and‐forget prefill)
+        
+        # 6) send eagle_acts if use_eagle
+        if self.config.use_eagle:
+            assert eagle_acts is not None, "eagle_acts must be provided when use_eagle is True"
+            dist.send(eagle_acts, dst=self.num_tp_gpus, group=self.model_runner.async_pg)
 
     def spec_prefill(self, seqs: list[Sequence]):
-        if self.config.draft_async:
-            self.async_draft_prefill_remote(seqs) # the first time we get this, mark seqs as finished after just prefill 
+        # Always target prefill first
+        print(f'[spec_prefill] target prefill', flush=True)
+        result = self.model_runner.call("run", seqs, True)
+        if self.config.use_eagle:
+            assert isinstance(result, tuple), "result must be a tuple when use_eagle is True"
+            token_ids, eagle_acts = result
+            print(f'[spec_prefill] target prefill with eagle, got TUPLE result about to fire and forget draft prefill', flush=True)
+            self.async_draft_prefill_remote(seqs, eagle_acts)
         else:
-            _ = self.draft_runner.call("run", seqs, True)
-
-        token_ids = self.model_runner.call("run", seqs, True)
+            token_ids = result
+            self.async_draft_prefill_remote(seqs, None)
 
         # recovery token will be first token in next fwd, but not yet in kvc of either model
         for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
