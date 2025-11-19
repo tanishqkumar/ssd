@@ -69,9 +69,10 @@ class Config:
                     self.fan_out_list_miss = self.fan_out_list 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
                 
-                if self.use_eagle: 
-                    if self.eagle_layers is None:
-                        L = self.hf_config.num_hidden_layers
-                        self.eagle_layers = [3, L//2, L-3]
+        if self.use_eagle: 
+            if self.eagle_layers is None:
+                L = self.hf_config.num_hidden_layers
+                self.eagle_layers = [3, L//2, L-3]
+                print(f'[Config] just set eagle_layers={self.eagle_layers}', flush=True)
         
         assert self.max_num_batched_tokens >= self.max_model_len

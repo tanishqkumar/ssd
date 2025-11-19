@@ -147,7 +147,7 @@ class Eagle3DecoderLayer(nn.Module):
         
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, token_embeddings)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states) + residual
         return hidden_states 
 
 class Eagle3DraftModel(nn.Module):
@@ -240,8 +240,10 @@ class Eagle3DraftForCausalLM(nn.Module):
         self.use_eagle = use_eagle
         self.eagle_layers = eagle_layers if eagle_layers is not None else []
         self.d_model_target = d_model_target
-        self.d2t = {}
-        self.t2d = {}
+        self.d2t = {}  # loaded by loader.py, converted to tensor after load_model
+        self.t2d = {}  # loaded by loader.py, converted to tensor after load_model
+        self.d2t_tensor = None  # will be set after load_model
+        self.t2d_tensor = None  # will be set after load_model
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
 
         print(f'Starting Eagle3DraftForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')

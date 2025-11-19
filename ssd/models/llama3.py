@@ -223,6 +223,7 @@ class LlamaModel(nn.Module):
         self.draft_async = draft_async
         self.use_eagle = use_eagle
         self.eagle_layers = eagle_layers
+        print(f'[LlamaModel] use_eagle={use_eagle}, eagle_layers={eagle_layers}', flush=True)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -259,12 +260,14 @@ class LlamaModel(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
             
-            if collected_acts is not None: collected_acts.append(hidden_states)
+            if collected_acts is not None and layer_idx in self.eagle_layers:
+                collected_acts.append(hidden_states)
         
         hidden_states, _ = self.norm(hidden_states, residual) 
         
         if collected_acts:
             eagle_acts = torch.cat(collected_acts, dim=-1)
+            print(f'[LlamaModel] eagle_acts shape={eagle_acts.shape}', flush=True)
             return hidden_states, eagle_acts
         else:
             return hidden_states
@@ -307,7 +310,8 @@ class LlamaForCausalLM(nn.Module):
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
 
         print(f'Starting LlamaForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
-        self.model = LlamaModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, tp_group=tp_group, tp_size=self.tp_size)
+        print(f'[LlamaForCausalLM] use_eagle={use_eagle}, eagle_layers={eagle_layers}', flush=True)
+        self.model = LlamaModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, eagle_layers=eagle_layers, tp_group=tp_group, tp_size=self.tp_size)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

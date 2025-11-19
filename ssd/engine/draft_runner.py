@@ -65,16 +65,30 @@ class DraftRunner(ModelRunner):
         for t in (input_ids, positions, cu_q, cu_k, slot_map, block_tables):
             dist.recv(t, src=0, group=self.async_pg)
 
-        # 4) set up context exactly like prepare_prefill() does:
-        # print(f'draft async prefill using context: cu_q={cu_q}, cu_k={cu_k}, max_q={max_q}, max_k={max_k}, slot_map={slot_map}, block_tables={block_tables}', flush=True)
+        # 4) receive eagle_acts if use_eagle
+        eagle_acts = None
+        if self.config.use_eagle:
+            eagle_acts = torch.zeros(total_new_tokens, 3 * self.config.d_model_target, 
+                                     dtype=torch.float16, device=self.device)
+            dist.recv(eagle_acts, src=0, group=self.async_pg)
+            assert eagle_acts is not None, "Draft must receive eagle_acts when use_eagle is True"
+            print(f'[draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, total_slots={total_slots}, max_q={max_q}, max_k={max_k}, batch_size={batch_size}', flush=True)
+            print(f'[draft_async_prefill] eagle_acts.shape={eagle_acts.shape}, input_ids.shape={input_ids.shape}', flush=True)
+            
+            # Map target vocab tokens to draft vocab using t2d
+            assert hasattr(self.model, 't2d_tensor') and self.model.t2d_tensor is not None, "t2d_tensor not loaded"
+            input_ids = self.model.t2d_tensor[input_ids]
+            print(f'[draft_async_prefill] Mapped input_ids from target vocab to draft vocab', flush=True)
+
+        # 5) set up context exactly like prepare_prefill() does:
         set_context(is_prefill=True, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max_q, max_seqlen_k=max_k,
                     slot_mapping=slot_map, context_lens=None) # , block_tables=block_tables, commenting this out essentially removes prefix caching
 
-        # 5) run the draft model in prefill mode
-        self.run_model(input_ids, positions, is_prefill=True, last_only=True) 
+        # 6) run the draft model in prefill mode
+        self.run_model(input_ids, positions, is_prefill=True, last_only=True, hidden_states=eagle_acts) 
         print(f'[draft_async_prefill] DRAFT PREFILL DONE', flush=True)
 
-        # 6) clean up
+        # 7) clean up
         reset_context()
 
     def _reset_tree_cache_tensors(self):
