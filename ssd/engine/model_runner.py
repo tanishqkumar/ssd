@@ -63,6 +63,7 @@ class ModelRunner:
         # determines whether we create a process group and our process is aware of others, etc
         self.world_size = config.num_gpus if should_use_dist else 1
         self.rank = rank
+        self.use_eagle = config.use_eagle
 
         if config.draft_async:
             self.draft_rank = config.num_gpus - 1
@@ -110,6 +111,7 @@ class ModelRunner:
             assert num_tp_gpus == 1, "ERROR in ModelRunner: draft should have tp_size=1"
             self.tp_pg = None # every rank is given an object from self.tp_pg, even tho draft doesnt participate it gets GROUP_NON_MEMBER object != None back, so we can't assert None here, we 
         
+        print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}', flush=True)
         model_type = self.setup_and_warmup_model_and_cudagraphs(config, self.hf_config, init_q, is_draft)
 
         if self.verbose: print(f'-----CAPTURED {model_type}CUDAGRAPH----', flush=True)
@@ -235,14 +237,7 @@ class ModelRunner:
             kwargs['eagle_layers'] = self.config.eagle_layers
             
         if model_class == Eagle3DraftForCausalLM:
-            # Eagle draft needs target d_model
-            # We can infer this from the target config if we had it, but here we are in draft runner
-            # Assuming Llama 3 8B target for now if not specified? 
-            # Actually, we should look at how Eagle3DraftForCausalLM uses d_model_target
-            # It uses it for the FC layer input: len(eagle_layers) * d_model_target
-            # We should probably pass this in config or infer it
-            # For now, let's assume standard Llama 3 hidden size if not provided
-            kwargs['d_model_target'] = config.d_model_target or 4096 # default to 4096 if not found
+            kwargs['d_model_target'] = config.d_model_target
             
         self.model = model_class(**kwargs)
 
@@ -250,6 +245,7 @@ class ModelRunner:
         if self.verbose:
             print(f'-----LOADING {model_type}MODEL----', flush=True)
         load_model(self.model, config.model)
+        
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
             self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
         if self.verbose:
@@ -601,7 +597,7 @@ class ModelRunner:
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             
-            if self.config.use_eagle: # TODO
+            if self.config.use_eagle: # TODO sampling + nccl comms at prefill time, 
                 if self.is_draft:
                     assert hidden_states is not None, "hidden_states required for EAGLE draft"
                     assert isinstance(self.model, Eagle3DraftForCausalLM)
@@ -613,7 +609,7 @@ class ModelRunner:
                     logits = self.model.compute_logits(outputs, last_only)
                     return logits, eagle_acts  # return eagle_acts as conditioning vector for draft
             else: 
-                outputs = self.model(input_ids, positions, hidden_states)
+                outputs = self.model(input_ids, positions)
                 logits = self.model.compute_logits(outputs, last_only)
                 return logits 
 
@@ -626,17 +622,32 @@ class ModelRunner:
 
 
     # should add spec_k that just loops this k times
-    def run(self, seqs: list[Sequence], is_prefill: bool, last_only: bool = True, draft_return_logits: bool = False, hidden_states: torch.Tensor | None = None) -> list[int] | tuple[list[int], torch.Tensor]:
+    def run(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+        last_only: bool = True,
+        draft_return_logits: bool = False,
+        hidden_states: torch.Tensor | None = None
+    ) -> list[int] | tuple[list[int], torch.Tensor]:
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs, verify=not last_only) 
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
+        
+        # Handle EAGLE returning (logits, conditioning_vector for next iter)
+        if self.config.use_eagle:
+            logits, conditioning = self.run_model(
+                input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
+        else:
+            logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         
         if last_only:
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             reset_context()
+            if conditioning is not None:
+                return token_ids, conditioning
             return (token_ids, logits) if draft_return_logits else token_ids
         else:
             reset_context()

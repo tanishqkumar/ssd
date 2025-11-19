@@ -22,11 +22,13 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict):
     if hasattr(model, 'd2t') and 'd2t' in state_dict:
         d2t_tensor = state_dict['d2t']
         model.d2t = {i: int(d2t_tensor[i].item()) for i in range(len(d2t_tensor))}
+        model.d2t_tensor = d2t_tensor.to('cuda').long()  # keep as tensor for fast indexing
         print(f"[load_model] Loaded d2t dictionary with {len(model.d2t)} entries")
     
     if hasattr(model, 't2d') and 't2d' in state_dict:
         t2d_tensor = state_dict['t2d']
         model.t2d = {i: int(t2d_tensor[i].item()) for i in range(len(t2d_tensor))}
+        model.t2d_tensor = t2d_tensor.to('cuda').long()  # keep as tensor for fast indexing
         print(f"[load_model] Loaded t2d dictionary with {len(model.t2d)} entries")
     
     # Load model weights
