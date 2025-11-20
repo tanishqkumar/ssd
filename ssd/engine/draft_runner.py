@@ -178,7 +178,7 @@ class DraftRunner(ModelRunner):
     def hit_cache_and_respond(self, request_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations=None):
         """Hits the cache (tensor-backed) and returns tensors to respond to the spec request."""
         global ttl, ttl_hit
-        V = self.hf_config.vocab_size
+        V = getattr(self.hf_config, 'draft_vocab_size', self.hf_config.vocab_size)
 
         torch.manual_seed(0)
         out_logits = torch.randn( 
@@ -197,12 +197,22 @@ class DraftRunner(ModelRunner):
         # Statistics
         ttl += int(B)
         
+        if self.config.verbose:
+            print(f"[hit_cache_and_respond] Request keys: {request_keys}", flush=True)
+            print(f"[hit_cache_and_respond] Cache state: {self.tree_cache_keys.shape[0]} entries", flush=True)
+            if self.tree_cache_keys.numel() > 0:
+                print(f"[hit_cache_and_respond] Cache keys sample: {self.tree_cache_keys[:min(5, self.tree_cache_keys.shape[0])]}", flush=True)
+        
         if self.tree_cache_keys.numel() > 0:
             # Vectorized membership against tensor cache
             eq = (request_keys.unsqueeze(1) == self.tree_cache_keys.unsqueeze(0))  # [B,T,3]
             match = torch.all(eq, dim=2)  # [B,T]
             cache_hits = match.any(dim=1)  # [B]
             ttl_hit += int(cache_hits.sum().item())
+            
+            if self.config.verbose:
+                print(f"[hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
+            
             # Fill hits
             if (cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate):
                 # print(f'[hit_cache_and_respond] got all cache hits, using cached logits and tokens', flush=True)
@@ -217,6 +227,8 @@ class DraftRunner(ModelRunner):
                     out_activations[sel] = self.tree_cache_activations[idx[sel]]
             elif self.config.jit_speculate: 
                 # print(f'[hit_cache_and_respond] found a cache miss, running jit speculate', flush=True)
+                if self.config.verbose:
+                    print(f"[hit_cache_and_respond] Running JIT speculate for cache misses", flush=True)
                 jit_acts = self.jit_speculate(
                     request_keys, 
                     num_tokens, 
@@ -230,6 +242,8 @@ class DraftRunner(ModelRunner):
                     out_activations = jit_acts
         elif self.config.jit_speculate:
             # Cache is empty (first iteration), must JIT all
+            if self.config.verbose:
+                print(f"[hit_cache_and_respond] Cache empty, running JIT speculate for all", flush=True)
             jit_acts = self.jit_speculate(
                 request_keys, 
                 num_tokens, 
@@ -278,11 +292,7 @@ class DraftRunner(ModelRunner):
 
         if target_recovery_activations is not None:
             dist.recv(target_recovery_activations, src=0, group=self.async_pg)
-            # cache_keys[:, 2] = cache_keys[:, 2] + self.model.t2d_tensor[cache_keys[:, 2]]
             cache_keys[:, 2] = self.model.t2d_tensor[cache_keys[:, 2]]
-            assert cache_keys[:, 2].min() >= 0 and cache_keys[:, 2].max() < self.hf_config.vocab_size, \
-                f"Converted cache_keys out of bounds: min={cache_keys[:, 2].min().item()}, max={cache_keys[:, 2].max().item()}, vocab_size={self.hf_config.vocab_size}"
-            print(f'[service_spec_request] survived woot', flush=True)
 
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
             cache_keys, 
@@ -582,7 +592,8 @@ class DraftRunner(ModelRunner):
         
         reset_context()
         
-        logits_flat = logits.view(-1, self.hf_config.vocab_size)  # [N, V]
+        V = getattr(self.hf_config, 'draft_vocab_size', self.hf_config.vocab_size)
+        logits_flat = logits.view(-1, V)  # [N, V]
         spec_logits[:, depth, :] = logits_flat
         next_tokens = self.sampler(logits_flat, payload["temps"], is_tree=True)
         spec_tokens[:, depth] = next_tokens
@@ -597,7 +608,7 @@ class DraftRunner(ModelRunner):
         B, K, F, N = metadata[0].item(), metadata[1].item(
         ), metadata[2].item(), metadata[3].item()
 
-        V = self.hf_config.vocab_size
+        V = getattr(self.hf_config, 'draft_vocab_size', self.hf_config.vocab_size)
         spec_tokens = torch.empty(
             (N, K), dtype=torch.int64, device=self.device)
         spec_logits = torch.empty(
