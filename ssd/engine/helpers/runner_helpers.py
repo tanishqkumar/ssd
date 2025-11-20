@@ -80,8 +80,10 @@ def prepare_block_tables_from_seqs(
 def prepare_prefill_tensors_from_seqs(
     seqs: list[Sequence],
     block_size: int,
-    is_draft: bool = False
+    is_draft: bool = False,
+    skip_first_token: int = 0
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert skip_first_token in (0, 1)
     input_ids = []
     positions = []
     cu_seqlens_q = [0]
@@ -99,9 +101,10 @@ def prepare_prefill_tensors_from_seqs(
             num_cached_tokens = seq.num_cached_tokens
             block_table = seq.block_table
 
-        input_ids.extend(seq[num_cached_tokens:])
-        positions.extend(list(range(num_cached_tokens, seqlen)))
-        seqlen_q = seqlen - num_cached_tokens
+        start = num_cached_tokens + (skip_first_token if is_draft else 0)
+        input_ids.extend(seq[start:])
+        positions.extend(list(range(start, seqlen)))
+        seqlen_q = seqlen - start
         seqlen_k = seqlen
         cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
         cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -113,7 +116,7 @@ def prepare_prefill_tensors_from_seqs(
 
         # new: emit exactly one slot for each *new* token
         #    map each token index -> (block_id * block_size + offset)
-        for pos in range(num_cached_tokens, seq.num_tokens):
+        for pos in range(start, seq.num_tokens):
             block_i = pos // block_size
             offset = pos % block_size
             slot = block_table[block_i] * block_size + offset

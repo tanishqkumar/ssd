@@ -222,5 +222,6 @@ vllm-env/
 *wandb* 
 wandb_runs/
 *.toml 
-agents.md 
+*.md
+!README.md
 docs/ 

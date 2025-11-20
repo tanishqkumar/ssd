@@ -284,9 +284,13 @@ class LLMEngine:
         """Verify speculative tokens using the target model."""
         batch_size = len(seqs_copy)
 
-        # returns [b, k+1, nh, hd]
-        logits_p_flat = self.model_runner.call(
+        result = self.model_runner.call(
             "run", seqs_copy, False, False, True)
+        
+        if self.config.use_eagle:
+            logits_p_flat, eagle_acts_flat = result
+        else:
+            logits_p_flat = result
 
         for s in seqs_copy:  # was debuge, but is correct 
             s.num_cached_tokens += self.config.speculate_k + 1
@@ -371,6 +375,10 @@ class LLMEngine:
                                   for suffix in new_suffixes) / len(new_suffixes)
             if __debug__: print(f"[verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
 
+        if self.config.use_eagle:
+            eagle_acts = eagle_acts_flat.view(batch_size, self.config.speculate_k + 1, -1)
+            return new_suffixes, recovery_tokens, eagle_acts
+        
         return new_suffixes, recovery_tokens
 
 
@@ -405,13 +413,29 @@ class LLMEngine:
         return sum(len(s) for s in new_suffixes)
 
     def async_draft_prefill_remote(self, seqs: list[Sequence], eagle_acts: torch.Tensor = None):
+        skip_first = 1 if self.config.use_eagle else 0
+        
         # 1) build all the prefill payload in one shot
         input_ids, positions, cu_q, cu_k, max_q, max_k, slot_map = \
             prepare_prefill_tensors_from_seqs(
                 seqs,
                 block_size=self.draft_cfg.kvcache_block_size,
-                is_draft=True
+                is_draft=True,
+                skip_first_token=skip_first
             )
+        
+        # Slice activations to match draft input
+        if eagle_acts is not None:
+            sliced_acts = []
+            offset = 0
+            for seq in seqs:
+                seq_len = seq.num_prompt_tokens
+                sliced_acts.append(eagle_acts[offset:offset + seq_len - 1])
+                offset += seq_len
+            eagle_acts = torch.cat(sliced_acts, dim=0)
+            assert eagle_acts.shape[0] == input_ids.shape[0], \
+                f"Activation length {eagle_acts.shape[0]} != input_ids length {input_ids.shape[0]}"
+        
         # 2) pad draft_block_table → block_tables
         max_blocks = (self.draft_cfg.max_model_len +
                       self.draft_cfg.kvcache_block_size - 1)//self.draft_cfg.kvcache_block_size
@@ -453,15 +477,24 @@ class LLMEngine:
             assert isinstance(result, tuple), "result must be a tuple when use_eagle is True"
             token_ids, eagle_acts = result
             print(f'[spec_prefill] target prefill with eagle, got TUPLE result about to fire and forget draft prefill', flush=True)
+            
+            offset = 0
+            for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+                seq.recovery_token_id = token_id
+                seq_len = seq.num_prompt_tokens
+                seq.last_target_hidden_state = eagle_acts[offset + seq_len - 1].clone()
+                offset += seq_len
+            
             self.async_draft_prefill_remote(seqs, eagle_acts)
         else:
             token_ids = result
+            for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+                seq.recovery_token_id = token_id
             self.async_draft_prefill_remote(seqs, None)
 
         # recovery token will be first token in next fwd, but not yet in kvc of either model
         for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
-            assert seq.recovery_token_id is None, "recovery token id should be None in first prefill"
-            seq.recovery_token_id = token_id
+            assert seq.recovery_token_id is not None
             seq.num_cached_tokens = seq.num_prompt_tokens
             seq.num_draft_cached_tokens = seq.num_prompt_tokens
         if len(seqs) > 0:
@@ -470,7 +503,11 @@ class LLMEngine:
 
     def normal_step(self, seqs: list[Sequence], is_prefill: bool):
         # this includes prepare_decode, set_context, etc
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        result = self.model_runner.call("run", seqs, is_prefill)
+        if self.config.use_eagle and isinstance(result, tuple):
+            token_ids, _ = result
+        else:
+            token_ids = result
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
 
     def async_spec_step(self, seqs: list[Sequence]):
@@ -478,8 +515,18 @@ class LLMEngine:
         seqs_copy, speculations, logits_q, cache_hits = self.speculate_async(
             seqs)
 
-        new_suffixes, recovery_tokens = self.verify(
+        verify_result = self.verify(
             seqs_copy, speculations, logits_q, cache_hits=cache_hits)
+        
+        if self.config.use_eagle:
+            new_suffixes, recovery_tokens, eagle_acts = verify_result
+            
+            for i, seq in enumerate(seqs):
+                accepted_len = len(new_suffixes[i])
+                idx = min(accepted_len - 1, eagle_acts.shape[1] - 1)
+                seq.last_target_hidden_state = eagle_acts[i, idx]
+        else:
+            new_suffixes, recovery_tokens = verify_result
 
         self.postprocess_speculate(seqs, new_suffixes, recovery_tokens)
         

@@ -57,6 +57,17 @@ class TargetDraftHandshake:
         self.draft_block_tables = torch.tensor([seq.draft_block_table + [-1] * (  
             self.config.max_blocks - len(seq.draft_block_table)) for seq in self.seqs], dtype=torch.int32, device=self.device)  # [B, max_blocks]
         
+        # Prepare recovery activations for EAGLE
+        if self.config.use_eagle:
+            for i, seq in enumerate(self.seqs):
+                assert seq.last_target_hidden_state is not None, \
+                    f"seq[{i}].last_target_hidden_state is None - must be set after prefill/verify"
+            self.recovery_activations = torch.stack([
+                seq.last_target_hidden_state for seq in self.seqs
+            ], dim=0).to(self.device)
+        else:
+            self.recovery_activations = None
+        
         # Post-condition shape validation
         assert self.cache_keys.shape == (self.B, 3), f"cache_keys shape mismatch: expected ({self.B}, 3), got {self.cache_keys.shape}"
         assert self.num_tokens.shape == (self.B,), f"num_tokens shape mismatch: expected ({self.B},), got {self.num_tokens.shape}"
@@ -83,6 +94,9 @@ class TargetDraftHandshake:
             self.draft_block_tables.to(torch.int64),
         )
         dist.send(self.temperatures, dst=self.draft_runner_rank, group=self.async_pg)
+        
+        if self.recovery_activations is not None:
+            dist.send(self.recovery_activations, dst=self.draft_runner_rank, group=self.async_pg)
     
     def receive_response(self, draft_cfg):
         """Receive the response: cache hits, speculations, and logits.
