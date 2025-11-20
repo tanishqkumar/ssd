@@ -637,6 +637,7 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
+        conditioning = None
         if self.config.use_eagle:
             logits, conditioning = self.run_model(
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
@@ -651,6 +652,8 @@ class ModelRunner:
             return (token_ids, logits) if draft_return_logits else token_ids
         else:
             reset_context()
+            if conditioning is not None:
+                return logits, conditioning
             return logits
     
 

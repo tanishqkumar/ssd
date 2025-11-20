@@ -30,6 +30,10 @@ class DraftRunner(ModelRunner):
         self.is_draft = True # this is is_draft, use self.config.draft for the draft model path 
         self.prev_num_tokens = None
         super().__init__(self.draft_cfg, rank=rank, event=None, is_draft=True, num_tp_gpus=1, init_q=init_q)
+        
+        if self.config.use_eagle:
+            assert self.config.jit_speculate, \
+                "EAGLE requires jit_speculate=True (cache misses need draft activations)"
 
         if self.is_draft and self.draft_async:
             self._reset_tree_cache_tensors()
@@ -37,6 +41,15 @@ class DraftRunner(ModelRunner):
             self.draft_loop()
 
     
+    # todo:
+    # - normally we do a prefill on draft with target activations after we get a verification outcome 
+    # - since we wait for the verification outcome to speculate on top of in ordinary (sync) spec
+    # - but here (async) when we glue decode the spec we just sent back we obv don't have its target activations yet (since target by defn hasn't verified) so we have to use our own 
+    # - where "our own" is stored in the tree cache for each spec rollout, where the glue decode is the tokens we just sent back so they must be in the tree cache
+    # - thus, all token fwds are self conditioned in [glue, tree] besides the first token (which is target conditioned input rec token after a verify, with acts from target)
+    # - this first token act from target should be sent over nccl along with each cache request, and should correpond to target preact (3 * d_model_target) that led to the logits from which rec token was sampled 
+    # - in the first iter, when the token sampled from target sequence to prefill is set as the first rec token, and we make a dummy cache request that always ends in a miss, 
+        # eg. with req key ("I", -2, 0) in "how can I" to the draft after target/draft prefill, how should we handle given we sent g_can (which would go with e_I in fwd) target -> draft in fwd? should we send dummy act and not use? 
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
 
@@ -75,7 +88,7 @@ class DraftRunner(ModelRunner):
             print(f'[draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, total_slots={total_slots}, max_q={max_q}, max_k={max_k}, batch_size={batch_size}', flush=True)
             print(f'[draft_async_prefill] eagle_acts.shape={eagle_acts.shape}, input_ids.shape={input_ids.shape}', flush=True)
             
-            # Map target vocab tokens to draft vocab using t2d
+            # Map target vocab tokens to draft vocab using t2d (direct lookup)
             assert hasattr(self.model, 't2d_tensor') and self.model.t2d_tensor is not None, "t2d_tensor not loaded"
             input_ids = self.model.t2d_tensor[input_ids]
             print(f'[draft_async_prefill] Mapped input_ids from target vocab to draft vocab', flush=True)
@@ -98,6 +111,7 @@ class DraftRunner(ModelRunner):
             (0, 3), dtype=torch.int64, device=self.device)
         self.tree_cache_tokens = None
         self.tree_cache_logits = None
+        self.tree_cache_activations = None
 
     def jit_speculate(self, 
                       request_keys: torch.Tensor, 
@@ -105,7 +119,8 @@ class DraftRunner(ModelRunner):
                       out_logits: torch.Tensor, 
                       out_tokens: torch.Tensor, 
                       temperatures: torch.Tensor, 
-                      draft_block_tables: torch.Tensor): # should run K+1 steps starting at nt + rq[i, 1]
+                      draft_block_tables: torch.Tensor,
+                      target_recovery_activations: torch.Tensor = None):
         
         # input_ids = rq[i, -1] the new rec tokens 
         input_ids = request_keys[:, -1] # [B]
@@ -117,6 +132,17 @@ class DraftRunner(ModelRunner):
         batch_indices = torch.arange(input_ids.shape[0], device=self.device)
         slot_map = draft_block_tables[batch_indices, block_idx] * self.block_size + pos_in_block
 
+        hidden_states = None
+        spec_activations = None
+        
+        if self.config.use_eagle:
+            assert target_recovery_activations is not None
+            hidden_states = self.model.fc(target_recovery_activations)
+            spec_activations = torch.empty(
+                input_ids.shape[0], self.config.speculate_k,
+                self.hf_config.hidden_size,
+                dtype=self.hf_config.torch_dtype, device=self.device)
+
         for i in range(self.config.speculate_k): # we're going to glue after this anyways 
             set_context(
                 is_prefill=False,
@@ -125,9 +151,17 @@ class DraftRunner(ModelRunner):
                 block_tables=draft_block_tables,
                 is_jit=True,
             )
-            out_logits[:, i, :] = self.run_model(input_ids, positions, is_prefill=False, last_only=True)
+            
+            if self.config.use_eagle:
+                logits, prenorm = self.run_model(input_ids, positions, is_prefill=False, last_only=True, hidden_states=hidden_states)
+                spec_activations[:, i] = prenorm
+                hidden_states = prenorm
+            else:
+                logits = self.run_model(input_ids, positions, is_prefill=False, last_only=True)
+            
+            out_logits[:, i, :] = logits
             reset_context()
-            next_tokens = self.sampler(out_logits[:, i, :], temperatures, is_tree=True)
+            next_tokens = self.sampler(logits, temperatures, is_tree=True)
             out_tokens[:, i] = next_tokens
             
             # Update for next iteration
@@ -139,9 +173,9 @@ class DraftRunner(ModelRunner):
             pos_in_block = positions % self.block_size
             slot_map = draft_block_tables[batch_indices, block_idx] * self.block_size + pos_in_block
 
-        return
+        return spec_activations
 
-    def hit_cache_and_respond(self, request_keys, B, K, num_tokens, temperatures, draft_block_tables):
+    def hit_cache_and_respond(self, request_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations=None):
         """Hits the cache (tensor-backed) and returns tensors to respond to the spec request."""
         global ttl, ttl_hit
         V = self.hf_config.vocab_size
@@ -153,6 +187,12 @@ class DraftRunner(ModelRunner):
         cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache_and_respond: request_keys should be (B, 3), got {request_keys.shape}"
+        
+        hidden_size = self.hf_config.hidden_size
+        out_activations = torch.zeros(
+            B, K, hidden_size,
+            dtype=self.hf_config.torch_dtype, device=self.device
+        ) if self.config.use_eagle else None
         
         # Statistics
         ttl += int(B)
@@ -173,20 +213,38 @@ class DraftRunner(ModelRunner):
                 out_tokens[sel] = self.tree_cache_tokens[idx[sel]]
                 # logits [T,K+1,V]
                 out_logits[sel] = self.tree_cache_logits[idx[sel]]
+                if self.config.use_eagle:
+                    out_activations[sel] = self.tree_cache_activations[idx[sel]]
             elif self.config.jit_speculate: 
                 # print(f'[hit_cache_and_respond] found a cache miss, running jit speculate', flush=True)
-                self.jit_speculate(
+                jit_acts = self.jit_speculate(
                     request_keys, 
                     num_tokens, 
                     out_logits, 
                     out_tokens,
                     temperatures,
-                    draft_block_tables
+                    draft_block_tables,
+                    target_recovery_activations
                     ) # write into out_logits, out_tokens
+                if self.config.use_eagle:
+                    out_activations = jit_acts
+        elif self.config.jit_speculate:
+            # Cache is empty (first iteration), must JIT all
+            jit_acts = self.jit_speculate(
+                request_keys, 
+                num_tokens, 
+                out_logits, 
+                out_tokens,
+                temperatures,
+                draft_block_tables,
+                target_recovery_activations
+                )
+            if self.config.use_eagle:
+                out_activations = jit_acts
             
         rec_toks = request_keys[:, 2]
         
-        return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits # gives [B*(K+1)] glue decode tokens
+        return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits, out_activations
 
     def _service_spec_request(self):
 
@@ -214,17 +272,33 @@ class DraftRunner(ModelRunner):
         assert off == fused_total
         temperatures = self.recv_tensor((B,), torch.float32)
 
-        out_tokens, out_logits, glue_decode_input_ids, cache_hits = self.hit_cache_and_respond(
+        target_recovery_activations = torch.zeros(
+            B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
+        ) if self.config.use_eagle else None
+
+        if target_recovery_activations is not None:
+            dist.recv(target_recovery_activations, src=0, group=self.async_pg)
+            # cache_keys[:, 2] = cache_keys[:, 2] + self.model.t2d_tensor[cache_keys[:, 2]]
+            cache_keys[:, 2] = self.model.t2d_tensor[cache_keys[:, 2]]
+            assert cache_keys[:, 2].min() >= 0 and cache_keys[:, 2].max() < self.hf_config.vocab_size, \
+                f"Converted cache_keys out of bounds: min={cache_keys[:, 2].min().item()}, max={cache_keys[:, 2].max().item()}, vocab_size={self.hf_config.vocab_size}"
+            print(f'[service_spec_request] survived woot', flush=True)
+
+        out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
             cache_keys, 
             B, 
             K, 
             num_tokens, 
             temperatures, 
-            draft_block_tables
+            draft_block_tables,
+            target_recovery_activations
             )
 
+        out_tokens_target_vocab = out_tokens if not self.config.use_eagle else \
+                                  self.model.d2t_tensor[out_tokens] # add gap here davidoo 
+
         # Send response: cache_hits and spec_tokens_flat in one fused message
-        fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
+        fused_response = torch.cat([cache_hits.reshape(-1), out_tokens_target_vocab.reshape(-1).to(torch.int64)])
         dist.send(fused_response, dst=0, group=self.async_pg)
         dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
 
@@ -235,6 +309,8 @@ class DraftRunner(ModelRunner):
             "dbt": draft_block_tables,
             "cache_hits": cache_hits, 
             "returned_tokens": out_tokens,
+            "target_recovery_activations": target_recovery_activations,
+            "previous_activations": out_activations,
         } 
 
         # from now on, need to thread cache_hits through tree decode and not assume that MQ_LEN is global constant, but varies with iteration depending on prev hit/miss
@@ -386,6 +462,24 @@ class DraftRunner(ModelRunner):
             B=B, 
         ) 
 
+        glue_hidden_states = None
+        glue_prenorm = None
+
+        if self.config.use_eagle:
+            hidden_size = self.hf_config.hidden_size
+            target_acts = partial_tree_decode_args["target_recovery_activations"]
+            prev_acts = partial_tree_decode_args["previous_activations"]
+            assert target_acts is not None
+            
+            glue_hidden_states = torch.zeros(B * (K+1), hidden_size,
+                                             dtype=self.hf_config.torch_dtype, device=self.device)
+            
+            glue_hidden_states[::K+1] = self.model.fc(target_acts)
+            
+            if prev_acts is not None:
+                glue_hs_view = glue_hidden_states.view(B, K+1, -1)
+                glue_hs_view[:, 1:, :] = prev_acts
+
         set_context(
             is_prefill=False,
             cu_seqlens_q=glue_decode_ctxt["cu_seqlens_q"],
@@ -395,9 +489,40 @@ class DraftRunner(ModelRunner):
             block_tables=glue_decode_ctxt["block_tables"]
         )
 
-        glue_decode_logits_flat = self.run_model(
-            glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"], is_prefill=False, last_only=False)  # runs the verify cudagraph
+        if self.config.use_eagle:
+            glue_decode_logits_flat, glue_prenorm = self.run_model(
+                glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"], 
+                is_prefill=False, last_only=False, hidden_states=glue_hidden_states)
+        else:
+            glue_decode_logits_flat = self.run_model(
+                glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"], 
+                is_prefill=False, last_only=False)
+            
         reset_context()
+    
+        tree_hidden_states = None
+        if glue_prenorm is not None:
+            glue_prenorm_reshaped = glue_prenorm.view(B, K+1, -1)
+            
+            cache_hits = partial_tree_decode_args["cache_hits"]
+            fan_out_hit = self.config.fan_out_t.tolist()
+            fan_out_miss = self.config.fan_out_t_miss.tolist()
+            tree_hidden_states = []
+            for b in range(B):
+                fan_out = fan_out_hit if bool(cache_hits[b].item()) else fan_out_miss
+                for depth in range(K+1):
+                    reps = int(fan_out[depth])
+                    if reps == 0:
+                        continue
+                    act = glue_prenorm_reshaped[b, depth].unsqueeze(0)
+                    tree_hidden_states.append(act.repeat(reps, 1))
+            
+            tree_hidden_states = torch.cat(tree_hidden_states, dim=0)
+            N = sum(
+                sum(self.config.fan_out_t.tolist()) if bool(cache_hits[b].item()) else sum(self.config.fan_out_t_miss.tolist())
+                for b in range(B)
+            )
+            assert tree_hidden_states.shape[0] == N
     
         glue_decode_logits = glue_decode_logits_flat.view(B, K+1, -1) # [B, K+1, V]
         forked_rec_tokens = get_forked_recovery_tokens_from_logits(
@@ -408,7 +533,9 @@ class DraftRunner(ModelRunner):
             tokenizer=self.tokenizer
         ).view(-1)  # [B*F*(K+1)] = [N], now [B*MQ_LEN]
 
-        return self._construct_tree_decode_args(partial_tree_decode_args, forked_rec_tokens, dbt)
+        tree_decode_args = self._construct_tree_decode_args(partial_tree_decode_args, forked_rec_tokens, dbt)
+        tree_decode_args["hidden_states"] = tree_hidden_states
+        return tree_decode_args
 
     @torch.inference_mode()
     def _compute_step_positions_and_slot_maps(self, initial_positions, initial_rope_positions, dbt, B, K, F, N, MQ_LEN):
@@ -434,7 +561,7 @@ class DraftRunner(ModelRunner):
         
         return step_positions, step_rope_positions, step_context_lens, step_slot_maps
 
-    def _decode_tree_step(self, depth, current_input_ids, step_rope_positions, step_slot_maps, step_context_lens, dbt, payload, spec_tokens, spec_logits):
+    def _decode_tree_step(self, depth, current_input_ids, step_rope_positions, step_slot_maps, step_context_lens, dbt, payload, spec_tokens, spec_logits, spec_activations):
         """Execute a single tree decode step."""
         # Use precomputed values for this step
         set_context(
@@ -444,7 +571,15 @@ class DraftRunner(ModelRunner):
             block_tables=dbt,
         )
 
-        logits = self.run_model(current_input_ids, step_rope_positions[depth], is_prefill=False, last_only=False, tree_decode_step=depth, cache_hits=payload["cache_hits"])
+        hidden_states = payload.get("hidden_states")
+        if self.config.use_eagle:
+            logits, prenorm = self.run_model(current_input_ids, step_rope_positions[depth], is_prefill=False, last_only=False, tree_decode_step=depth, cache_hits=payload["cache_hits"], hidden_states=hidden_states)
+            assert spec_activations is not None
+            spec_activations[:, depth] = prenorm
+            payload["hidden_states"] = prenorm
+        else:
+            logits = self.run_model(current_input_ids, step_rope_positions[depth], is_prefill=False, last_only=False, tree_decode_step=depth, cache_hits=payload["cache_hits"])
+        
         reset_context()
         
         logits_flat = logits.view(-1, self.hf_config.vocab_size)  # [N, V]
@@ -467,6 +602,10 @@ class DraftRunner(ModelRunner):
             (N, K), dtype=torch.int64, device=self.device)
         spec_logits = torch.empty(
             (N, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
+        spec_activations = torch.empty(
+            (N, K, self.hf_config.hidden_size),
+            dtype=self.hf_config.torch_dtype, device=self.device
+        ) if self.config.use_eagle else None
 
         # Precompute all positions, context_lens, and slot_maps for all K steps
         initial_positions = payload["positions"].clone()  # [N]
@@ -482,12 +621,12 @@ class DraftRunner(ModelRunner):
         for depth in range(K):
             current_input_ids = self._decode_tree_step(
                 depth, current_input_ids, step_rope_positions, step_slot_maps, 
-                step_context_lens, dbt, payload, spec_tokens, spec_logits
+                step_context_lens, dbt, payload, spec_tokens, spec_logits, spec_activations
             )
 
-        return spec_tokens, spec_logits
+        return spec_tokens, spec_logits, spec_activations
 
-    def _populate_tree_cache(self, payload, tokens, logits, cache_hits):
+    def _populate_tree_cache(self, payload, tokens, logits, cache_hits, activations=None):
         """Populates the tensor-backed tree_cache with the results of the decoding.
         """
         seq_ids_expanded = payload["seq_ids_expanded"].to(torch.int64)
@@ -515,6 +654,7 @@ class DraftRunner(ModelRunner):
         self.tree_cache_keys = keys
         self.tree_cache_tokens = tokens
         self.tree_cache_logits = logits
+        self.tree_cache_activations = activations
     
     def _start_interrupt_listener(self):  # TODO: do we need an irecv here? do we use it? or should we just listen after we finish tree decoding
         """Initiates a non-blocking receive for the next command to allow interruption."""
@@ -551,10 +691,10 @@ class DraftRunner(ModelRunner):
                 tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)  # ~3ms --> leaves ~28ms for decoding
 
                 # Decode the branch tree (with early interruption)
-                tokens, logits = self._decode_tree_interruptibly(tree_decode_args)
+                tokens, logits, activations = self._decode_tree_interruptibly(tree_decode_args)
 
                 # Populate the local cache so future spec-requests can hit
-                self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"])
+                self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
 
                 continue
 
