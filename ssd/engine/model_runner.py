@@ -581,8 +581,8 @@ class ModelRunner:
             self.hf_config.head_dim,
             self.block_size,
             custom_mask=custom_mask,
-            q_data_type=torch.bfloat16,
-            kv_data_type=torch.bfloat16,
+            q_data_type=torch.bfloat16 if not self.config.use_eagle else torch.float16,
+            kv_data_type=torch.bfloat16 if not self.config.use_eagle else torch.float16,
         )
 
     @torch.inference_mode()
