@@ -36,14 +36,13 @@ def get_forked_recovery_tokens_from_logits(config: Config, logits: torch.Tensor,
     Returns:
         idxs: [B, sum(fan_out_list)]
     """
-    B, _, _ = logits.shape
+    B, _, V_actual = logits.shape
     K = config.speculate_k
     fan_out_list = config.fan_out_list
     fan_out_list_miss = config.fan_out_list_miss
-    V = config.hf_config.vocab_size
     # lets scatter then repeat the temp matched expt -- we should do better
     assert cache_hits.shape == (B,), f"cache_hits must have shape (B,), got {cache_hits.shape}"
-    assert logits.shape == (B, K+1, V), f"logits must have shape (B, K+1, V), got {logits.shape}"
+    assert logits.shape[0] == B and logits.shape[1] == K+1, f"logits must have shape (B, K+1, V), got {logits.shape}"
     assert len(fan_out_list) == K + 1, f"fan_out_list must have length K+1={K+1}, got {len(fan_out_list)}"
     assert returned_tokens.shape == (B, K+1), f"returned_tokens must have shape (B, K+1), got {returned_tokens.shape}"
     

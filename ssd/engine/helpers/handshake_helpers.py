@@ -122,7 +122,7 @@ class TargetDraftHandshake:
         assert hasattr(draft_cfg.hf_config, 'vocab_size'), "draft_cfg.hf_config must have vocab_size attribute"
         assert hasattr(draft_cfg.hf_config, 'torch_dtype'), "draft_cfg.hf_config must have torch_dtype attribute"
         
-        V = draft_cfg.hf_config.vocab_size
+        V = getattr(draft_cfg.hf_config, 'draft_vocab_size', draft_cfg.hf_config.vocab_size)
         logits_q = torch.empty(self.B, self.K, V, dtype=draft_cfg.hf_config.torch_dtype, device=self.device)
         dist.recv(logits_q, src=self.draft_runner_rank, group=self.async_pg)
         
