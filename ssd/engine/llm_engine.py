@@ -171,6 +171,7 @@ class LLMEngine:
 
     # make and send [cache_keys, num_tokens, dbt, temps] tensors, since no Seq objects can be sent via NCCL
     # recv [cache_hits, spec_tokens_flat, logits_q], contract specified in handshake_helpers.py
+        # this bounds the difference 
     def target_draft_handshake(self, seqs_copy: list[Sequence]):
         """Send a spec request command with cache keys to get speculations/logits."""
         draft_runner_rank = self.num_tp_gpus
@@ -207,6 +208,20 @@ class LLMEngine:
                 raise ValueError(
                     f"recovery_token_id is None for seq {seq.seq_id}")
             seq.append_token(seq.recovery_token_id)
+        
+        # Log sequence trunk state for debugging
+        if self.config.verbose:
+            print(f"\n{'='*80}", flush=True)
+            print(f"[TARGET SEQUENCE TRUNK] Batch size: {len(seqs)}", flush=True)
+            for i, seq in enumerate(seqs):
+                # Show last 20 tokens of trunk + recovery token
+                trunk_tokens = seq.token_ids[-20:] if len(seq.token_ids) > 20 else seq.token_ids
+                trunk_text = self.tokenizer.decode(trunk_tokens, skip_special_tokens=False)
+                recovery_text = self.tokenizer.decode([seq.recovery_token_id], skip_special_tokens=False)
+                print(f"  Seq {seq.seq_id} (len={len(seq.token_ids)}):", flush=True)
+                print(f"    Trunk (last 20): ...{trunk_text}", flush=True)
+                print(f"    Recovery token: {seq.recovery_token_id} ('{recovery_text}')", flush=True)
+            print(f"{'='*80}\n", flush=True)
 
         # hit draft tree cache via handshake API, this bounds them
         cache_hits, speculations_tokens, logits_q = self.target_draft_handshake(
@@ -444,6 +459,7 @@ class LLMEngine:
                 (max_blocks - len(s.draft_block_table)) for s in seqs],
             dtype=torch.int32, device=self.draft_cfg.device,
         )
+        
         # 3) send cmd=1
         cmd = torch.tensor([1], dtype=torch.int64, device=self.config.device)
         dist.send(cmd, dst=self.num_tp_gpus, group=self.model_runner.async_pg)
