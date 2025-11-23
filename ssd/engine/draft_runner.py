@@ -81,7 +81,7 @@ class DraftRunner(ModelRunner):
         # 4) receive eagle_acts if use_eagle
         eagle_acts = None
         if self.config.use_eagle:
-            eagle_acts = torch.zeros(total_new_tokens, 3 * self.config.d_model_target, 
+            eagle_acts = torch.empty(total_new_tokens, 3 * self.config.d_model_target, 
                                      dtype=torch.float16, device=self.device)
             dist.recv(eagle_acts, src=0, group=self.async_pg)
             assert eagle_acts is not None, "Draft must receive eagle_acts when use_eagle is True"
@@ -134,10 +134,10 @@ class DraftRunner(ModelRunner):
                       draft_block_tables: torch.Tensor,
                       target_recovery_activations: torch.Tensor = None):
         
-        # input_ids = rq[i, -1] the new rec tokens 
-        input_ids = request_keys[:, -1] # [B]
-        positions = num_tokens - 1 # [B]
-        context_lens = positions + 1 # [B]
+        input_ids = request_keys[:, -1]
+        pos_offset = -1 if self.config.use_eagle else 0
+        positions = num_tokens - 1 + pos_offset
+        context_lens = num_tokens + pos_offset
         # Calculate slot mapping vectorized
         block_idx = positions // self.block_size
         pos_in_block = positions % self.block_size
@@ -155,7 +155,7 @@ class DraftRunner(ModelRunner):
                 self.hf_config.hidden_size,
                 dtype=self.hf_config.torch_dtype, device=self.device)
 
-        for i in range(self.config.speculate_k): # we're going to glue after this anyways 
+        for i in range(self.config.speculate_k): # we're going to glue after this anyways, and by sending the spec request target has verified we have K more slots left in our last page 
             set_context(
                 is_prefill=False,
                 slot_mapping=slot_map,
@@ -373,28 +373,12 @@ class DraftRunner(ModelRunner):
 
     
     def prepare_glue_decode_ctxt(self, num_tokens, input_ids, dbt, B):
-        """Prepares the VERIFY context for glue forward (varlen decode).
-
-        num_tokens = num tokens in sequence, incl newly appended rec token not yet forwarded through draft 
-        input_ids = for glue decode, shape [B * (K + 1)] since we pass in flat 
-        dbt = draft block tables, shape [B, M]
-        B = batch size
-
-        Builds varlen decode tensors so that for each sequence i (out of B):
-        - query length = K + 1
-        - key length   = num_tokens[i] - 1 + (K + 1)
-        We also compute slot_mapping for exactly the K+1 query tokens, so they
-        are written into the KV cache in their correct slots.
-        """
-
-        assert num_tokens.shape == (
-            B,), f"ERROR in prepare_glue_decode_ctxt: num_tokens should be (B,), got {num_tokens.shape}"
+        assert num_tokens.shape == (B,), f"ERROR in prepare_glue_decode_ctxt: num_tokens should be (B,), got {num_tokens.shape}"
 
         K = self.config.speculate_k
-        
-        # Grid of absolute positions for K+1 tokens
-        positions_start = (num_tokens - 1).unsqueeze(-1)  # [B, 1]
-        positions_grid = positions_start + torch.arange(K + 1, device=self.device)  # [B, K+1]
+        pos_offset = -1 if self.config.use_eagle else 0
+        positions_start = (num_tokens - 1 + pos_offset).unsqueeze(-1)
+        positions_grid = positions_start + torch.arange(K + 1, device=self.device)
 
         # Calculate block indices and offsets for ALL positions
         block_indices = (positions_grid //
@@ -421,25 +405,20 @@ class DraftRunner(ModelRunner):
         assert input_ids.dim() == 1 == positions_flat.dim() == slot_map_flat.dim(), \
             f"input_ids, positions_flat, and slot_map_flat should all be 1D, got shapes {input_ids.shape}, {positions_flat.shape}, {slot_map_flat.shape}"
         
-        # Build cu_seqlens_q
-        seqlen_q = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)  # [B]
-        context_lens = ((num_tokens - 1) + (K + 1)).to(torch.int32)  # [B]
-        cu_seqlens_q = torch.zeros(
-            B + 1, dtype=torch.int32, device=self.device)
+        seqlen_q = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
+        context_lens = (num_tokens + pos_offset + K).to(torch.int32)
+        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q[1:] = torch.cumsum(seqlen_q, dim=0)
 
-        # print(f'[prepare_glue_decode_ctxt] input_ids: {[self.tokenizer.decode([token_id]) for token_id in input_ids.tolist()]}', flush=True)
-        glue_decode_context = {
-            "input_ids": input_ids,              # [B * (K+1)]
-            "positions": positions_flat,              # [B * (K+1)]
-            "slot_map": slot_map_flat,                # [B * (K+1)]
-            "cu_seqlens_q": cu_seqlens_q,            # [B+1]
-            "max_seqlen_q": K + 1,                   # [1]
-            "context_lens": context_lens,            # [B], 
-            "block_tables": dbt,                     # [B, M], these have long megaspec space allocated for each branch 
+        return {
+            "input_ids": input_ids,
+            "positions": positions_flat,
+            "slot_map": slot_map_flat,
+            "cu_seqlens_q": cu_seqlens_q,
+            "max_seqlen_q": K + 1,
+            "context_lens": context_lens,
+            "block_tables": dbt,
         }
-
-        return glue_decode_context
 
     def _construct_tree_decode_args(self, partial_tree_decode_args, rec_flat, dbt):
         # tree decode needs (input_ids, positions) that are [N], wrapper plan handles batch size of attn computation 
@@ -462,10 +441,11 @@ class DraftRunner(ModelRunner):
         fkp1_flat = torch.arange(self.config.MQ_LEN, device=self.device, dtype=torch.int64).repeat(B) 
         assert fkp1_flat.shape == (N,), f"ERROR in _construct_tree_decode_args: fkp1_flat should be (N,), got {fkp1_flat.shape}"
         
-        seq_ids = partial_tree_decode_args["seq_ids"] # [B]
+        seq_ids = partial_tree_decode_args["seq_ids"]
         seq_ids_expanded = seq_ids[b_flat]
         assert seq_ids_expanded.shape == (N,), f"ERROR in _construct_tree_decode_args: seq_ids_expanded should be (N,), got {seq_ids_expanded.shape}"
-        positions = (partial_tree_decode_args["num_tokens"][b_flat] - 1) + (K + 1) + fkp1_flat # this is crucial to get right, differs from sq/batch fan out
+        pos_offset = -1 if self.config.use_eagle else 0
+        positions = (partial_tree_decode_args["num_tokens"][b_flat] - 1 + pos_offset) + (K + 1) + fkp1_flat
         # make rope_positions which all start at after K+1 of the glue decode are done 
         # j_idx_flat = fkp1_flat // F # this assumes unif fan out over lookahead
         # j_idx_flat = torch.arange(
@@ -476,7 +456,7 @@ class DraftRunner(ModelRunner):
             for hit in cache_hits
         ])
         assert j_idx_flat.shape == (N,), f"ERROR in _construct_tree_decode_args: j_idx_flat should be (N,), got {j_idx_flat.shape}"
-        rope_positions = (partial_tree_decode_args["num_tokens"][b_flat] - 1) + j_idx_flat + 1
+        rope_positions = (partial_tree_decode_args["num_tokens"][b_flat] - 1 + pos_offset) + j_idx_flat + 1
         assert rope_positions.shape == (N,), f"ERROR in _construct_tree_decode_args: rope_positions should be (N,), got {rope_positions.shape}"
         temperatures = partial_tree_decode_args["temperatures"][b_flat]
 
@@ -626,13 +606,9 @@ class DraftRunner(ModelRunner):
 
     @torch.inference_mode()
     def _compute_step_positions_and_slot_maps(self, initial_positions, initial_rope_positions, dbt, B, K, F, N, MQ_LEN):
-        """Precompute positions and slot maps for all K steps - batch size independent logic."""
-        # Precompute positions for all steps: [K, N]
         step_positions = initial_positions[None, :] + torch.arange(K, device=self.device)[:, None] * MQ_LEN
         step_rope_positions = initial_rope_positions[None, :] + torch.arange(K, device=self.device)[:, None]
-        
-        # Precompute context_lens for all steps: [K, B]
-        step_context_lens = step_positions.view(K, B, MQ_LEN)[:, :, -1] + 1  # [K, B]
+        step_context_lens = step_positions.view(K, B, MQ_LEN)[:, :, -1] + 1
         
         # Precompute slot_maps for all steps: [K, N]
         # b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[:, None, None].expand(B, K+1, F).flatten()  # [N], be careful here!

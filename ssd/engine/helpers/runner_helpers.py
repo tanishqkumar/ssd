@@ -103,9 +103,10 @@ def prepare_prefill_tensors_from_seqs(
 
         start = num_cached_tokens + (skip_first_token if is_draft else 0)
         input_ids.extend(seq[start:])
-        positions.extend(list(range(start, seqlen)))
+        pos_offset = -skip_first_token if is_draft else 0
+        positions.extend(list(range(start + pos_offset, seqlen + pos_offset)))
         seqlen_q = seqlen - start
-        seqlen_k = seqlen
+        seqlen_k = seqlen + pos_offset
         cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
         cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
         max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -116,16 +117,11 @@ def prepare_prefill_tensors_from_seqs(
 
         # new: emit exactly one slot for each *new* token
         #    map each token index -> (block_id * block_size + offset)
-        for pos in range(start, seq.num_tokens):
+        for pos in range(start + pos_offset, seq.num_tokens + pos_offset):
             block_i = pos // block_size
             offset = pos % block_size
             slot = block_table[block_i] * block_size + offset
             slot_mapping.append(slot)
-
-    # print(
-    #     f'positions {positions} in prepare_decode_tensors_from_seqs', flush=True)
-    # print(
-    #     f'slot_mapping {slot_mapping} in prepare_decode_tensors_from_seqs', flush=True)
 
     input_ids = torch.tensor(
         input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)

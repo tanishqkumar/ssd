@@ -289,6 +289,7 @@ def main():
         for i, prompt in enumerate(prompts):
             if isinstance(prompt, str):
                 # Load tokenizer to count tokens
+                print(f'Prompt: {prompt}')
                 tokenizer = AutoTokenizer.from_pretrained(model_path)
                 num_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
             elif isinstance(prompt, list):
