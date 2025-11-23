@@ -31,6 +31,28 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict):
         model.t2d_tensor = t2d_tensor.to('cuda').long()  # keep as tensor for fast indexing
         print(f"[load_model] Loaded t2d dictionary with {len(model.t2d)} entries")
     
+    # Check for embedding layer
+    found_embed_tokens = False
+    found_any_embed = False
+    for weight_name in state_dict.keys():
+        if 'embed' in weight_name.lower():
+            found_any_embed = True
+            if 'embed_tokens' in weight_name:
+                found_embed_tokens = True
+                break
+    
+    if not found_embed_tokens:
+        if found_any_embed:
+            raise ValueError(
+                f"[load_model] ERROR: Found embedding layer(s) in EAGLE3 weights but not 'embed_tokens'. "
+                f"Available weights: {list(state_dict.keys())}"
+            )
+        else:
+            raise ValueError(
+                f"[load_model] ERROR: No embedding layer found in EAGLE3 weights. "
+                f"Expected 'embed_tokens' or similar. Available weights: {list(state_dict.keys())}"
+            )
+    
     # Load model weights
     for weight_name, loaded_weight in tqdm(state_dict.items(), desc="Loading EAGLE3 weights"):
         # Skip the dictionary tensors as we've already processed them

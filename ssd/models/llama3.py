@@ -258,10 +258,11 @@ class LlamaModel(nn.Module):
         collected_acts = [] if self.use_eagle else None
         
         for layer_idx, layer in enumerate(self.layers):
+            if collected_acts is not None and layer_idx in self.eagle_layers:
+                current_act = hidden_states if residual is None else hidden_states + residual 
+                collected_acts.append(current_act)
             hidden_states, residual = layer(positions, hidden_states, residual)
             
-            if collected_acts is not None and layer_idx in self.eagle_layers:
-                collected_acts.append(hidden_states)
         
         hidden_states, _ = self.norm(hidden_states, residual) 
         

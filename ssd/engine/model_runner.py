@@ -597,7 +597,7 @@ class ModelRunner:
             if is_tree_decode:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
             
-            if self.config.use_eagle: # TODO sampling + nccl comms at prefill time, 
+            if self.config.use_eagle: 
                 if self.is_draft:
                     assert hidden_states is not None, "hidden_states required for EAGLE draft"
                     assert isinstance(self.model, Eagle3DraftForCausalLM)
