@@ -244,7 +244,10 @@ class ModelRunner:
         model_type = "DRAFT " if self.is_draft else "TARGET "
         if self.verbose:
             print(f'-----LOADING {model_type}MODEL----', flush=True)
-        load_model(self.model, config.model)
+        
+        # Pass tokenizer_path as target_path if it's available (mostly for Eagle draft)
+        target_path = getattr(config, 'tokenizer_path', None)
+        load_model(self.model, config.model, target_path=target_path)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
             self.async_pg = dist.new_group(ranks=[0, self.draft_rank])

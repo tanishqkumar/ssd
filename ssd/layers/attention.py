@@ -52,6 +52,7 @@ class Attention(nn.Module):
         draft: bool = False,
         speculate: bool = False,
         draft_async: bool = False,
+        use_eagle: bool = False,
         F: int = 1,
         K: int = 1, 
     ):
@@ -64,6 +65,7 @@ class Attention(nn.Module):
         self.draft = draft
         self.speculate = speculate
         self.draft_async = draft_async
+        self.use_eagle = use_eagle
         self.prefill_wrappers = {}
         self.F = F # async_fan_out
         self.K = K # speculate_k
@@ -82,6 +84,7 @@ class Attention(nn.Module):
             store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping) 
         
         if context.is_prefill:
+            
             if context.block_tables is not None:    # prefix cache, ie. if any of our seqs got a page hit in kvc
                 k, v = k_cache, v_cache
             
@@ -103,7 +106,6 @@ class Attention(nn.Module):
             )
 
             if verify_or_glue:
-                # assume q = q_varlen is correctly at this point (-1, nh, hd) like in prefill path, no need to reshape
                 assert context.context_lens is not None
                 o = flash_attn_with_kvcache(q, k_cache, v_cache, 
                                         cache_seqlens=context.context_lens, page_table=context.block_tables, 
@@ -128,7 +130,6 @@ class Attention(nn.Module):
                             prefill_wrapper = self.prefill_wrappers[wrapper_bs]
                         o = prefill_wrapper.run(q, (self.k_cache, self.v_cache))
                 else: # single query decode, sync spec and normal decoding 
-                    # [bs, 1, num_heads, head_dim]
                     q = q.unsqueeze(1)
                     o = flash_attn_with_kvcache(q, k_cache, v_cache,
                                                 cache_seqlens=context.context_lens, page_table=context.block_tables,
