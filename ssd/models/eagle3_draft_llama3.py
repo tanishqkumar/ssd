@@ -232,6 +232,7 @@ class Eagle3DraftForCausalLM(nn.Module):
         assert eagle_layers is not None, "ERROR in Eagle3DraftForLlama3: eagle_layers must be set"
 
         # this will be the draft that does tree decode, just needs a modified fwd pass that takes in hidden states and uses fc and dicts to sample, etc 
+        self.config = config
         self.draft = draft
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
@@ -251,7 +252,7 @@ class Eagle3DraftForCausalLM(nn.Module):
         self.final_norm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.model = Eagle3DraftModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, eagle_layers=eagle_layers, tp_group=tp_group, tp_size=self.tp_size)
         self.lm_head = ParallelLMHead(
-            config.draft_vocab_size, # TODO: this is different for eagle draft, ie. 32_000 vs 128_256, use draft_vocab
+            config.draft_vocab_size,  # LM head size (subset of tokens draft can propose)
             config.hidden_size,
             draft_async=draft_async,
             tp_group=tp_group,
@@ -284,10 +285,39 @@ class Eagle3DraftForCausalLM(nn.Module):
         last_only: bool = True, 
     ) -> torch.Tensor:
         hidden_states = self.final_norm(hidden_states)
-        logits = self.lm_head(hidden_states, last_only=last_only)
-        return logits
+        logits = self.lm_head(hidden_states, last_only=last_only)  # [B, draft_vocab_size]
 
-    # def sample(draft_vocab_logits: torch.Tensor) -> list[int]: # needs to use d2t/t2d dicts 
+        if logits.dim() == 3:
+            logits = logits.view(-1, logits.shape[-1])
+        
+        # Expand draft vocab logits to full target vocab using d2t mapping
+        # Draft LM head has draft_vocab_size rows, map them to target vocab positions
+        assert self.d2t_tensor is not None, "d2t_tensor must be loaded before inference"
+        assert hasattr(self.config, 'vocab_size'), "config must have vocab_size (target vocab)"
+        assert hasattr(self.config, 'draft_vocab_size'), "config must have draft_vocab_size"
+        
+        B = logits.shape[0]
+        vocab_size = self.config.vocab_size  # Target vocab size from config
+        
+        # Map draft indices to target vocab positions: target_idx = draft_idx + d2t_tensor[draft_idx]
+        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+        target_indices = base + self.d2t_tensor  # [draft_vocab_size]
+        # target_indices = self.d2t_tensor  # [draft_vocab_size]
+        # Debug logging once per run
+        if not hasattr(self, '_vocab_debug_printed'):
+            print(
+                f'[compute_logits DEBUG] draft_vocab_size={self.config.draft_vocab_size}, target_vocab_size={vocab_size}', flush=True)
+            print(
+                f'[compute_logits DEBUG] d2t_tensor[:10]={target_indices[:10].tolist()}', flush=True)
+            print(
+                f'[compute_logits DEBUG] d2t_tensor[-10:]={target_indices[-10:].tolist()}', flush=True)
+            self._vocab_debug_printed = True
+        
+        # Scatter draft logits into full vocab space, -inf elsewhere
+        logits_full = logits.new_full((B, vocab_size), float('-inf'))
+        logits_full[:, target_indices] = logits
+        
+        return logits_full 
 
 ''' 
 ----- eagle3 draft weights for target=llama 3.1 8b ----- 
@@ -325,7 +355,7 @@ If DECODE
         - Uses its own lm_head preactivations which are d_model_draft as conditioning input in later iter > 0 of tree decode 
     - Do similar to prefill where we draft fwd but decode so num_tokens = B (num seqs being decoded)
     - Keep prenorms before lm_head as well as logits after lm_head, use the former as input to the next iter and the latter for sampling the token also for the next iter 
-    - Each model should only see/ingest tokens from its own vocab -- prefill tokens send to draft need to be map(t2d) first and vice versa when draft sends back its speculations to target 
+    - Draft always operates on target vocab token IDs. Draft LM head outputs draft_vocab_size logits, expanded to vocab_size in compute_logits via d2t mapping 
 
 
 Impl plan: 
