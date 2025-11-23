@@ -81,6 +81,7 @@ class Eagle3Attention(nn.Module):
             draft=draft,
             speculate=speculate,
             draft_async=draft_async,
+            use_eagle=True,
             F=async_fan_out,
             K=spec_k,
         )

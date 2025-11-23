@@ -9,7 +9,53 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
-def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict):
+def load_embedding_from_target(model: nn.Module, target_path: str) -> bool:
+    """Try to load embedding weights from target model path (safetensors or bin)"""
+    target_keys = ["model.embed_tokens.weight", "embed_tokens.weight"]
+    
+    # Try safetensors first
+    safetensor_files = glob(os.path.join(target_path, "*.safetensors"))
+    for file in safetensor_files:
+        try:
+            with safe_open(file, "pt", "cpu") as f:
+                keys = f.keys()
+                for key in target_keys:
+                    if key in keys:
+                        print(f"[load_model] Found embedding {key} in {file}")
+                        tensor = f.get_tensor(key)
+                        # Always load into model.embed_tokens.weight for EAGLE
+                        param = model.get_parameter("model.embed_tokens.weight")
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, tensor)
+                        return True
+        except Exception as e:
+            print(f"[load_model] Error reading safetensor {file}: {e}")
+            continue
+
+    # Try bin files
+    bin_files = glob(os.path.join(target_path, "pytorch_model*.bin"))
+    for file in bin_files:
+        try:
+            # Load only if necessary? No way to peek keys without loading header or whole file for bin.
+            # But usually we can just load map_location=cpu
+            print(f"[load_model] Checking {file} for embeddings...")
+            state_dict = torch.load(file, map_location="cpu")
+            for key in target_keys:
+                if key in state_dict:
+                    print(f"[load_model] Found embedding {key} in {file}")
+                    tensor = state_dict[key]
+                    param = model.get_parameter("model.embed_tokens.weight")
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, tensor)
+                    return True
+        except Exception as e:
+            print(f"[load_model] Error reading bin {file}: {e}")
+            continue
+            
+    return False
+
+
+def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, target_path: str = None):
     """Load EAGLE3 draft model weights from pytorch_model.bin"""
     print(f"[load_model] Detected EAGLE3 draft model, loading from pytorch_model.bin")
     bin_file = os.path.join(path, "pytorch_model.bin")
@@ -42,16 +88,22 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict):
                 break
     
     if not found_embed_tokens:
-        if found_any_embed:
-            raise ValueError(
-                f"[load_model] ERROR: Found embedding layer(s) in EAGLE3 weights but not 'embed_tokens'. "
-                f"Available weights: {list(state_dict.keys())}"
-            )
-        else:
-            raise ValueError(
-                f"[load_model] ERROR: No embedding layer found in EAGLE3 weights. "
-                f"Expected 'embed_tokens' or similar. Available weights: {list(state_dict.keys())}"
-            )
+        if target_path:
+            print(f"[load_model] 'embed_tokens' not found in draft weights. Attempting to load from target path: {target_path}")
+            if load_embedding_from_target(model, target_path):
+                found_embed_tokens = True
+        
+        if not found_embed_tokens:
+            if found_any_embed:
+                raise ValueError(
+                    f"[load_model] ERROR: Found embedding layer(s) in EAGLE3 weights but not 'embed_tokens'. "
+                    f"Available weights: {list(state_dict.keys())}"
+                )
+            else:
+                raise ValueError(
+                    f"[load_model] ERROR: No embedding layer found in EAGLE3 weights. "
+                    f"Expected 'embed_tokens' or similar. Available weights: {list(state_dict.keys())}"
+                )
     
     # Load model weights
     for weight_name, loaded_weight in tqdm(state_dict.items(), desc="Loading EAGLE3 weights"):
@@ -114,7 +166,7 @@ def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: 
                     weight_loader(param, f.get_tensor(weight_name))
 
 
-def load_model(model: nn.Module, path: str):
+def load_model(model: nn.Module, path: str, target_path: str = None):
     print(f"[load_model] loading model from {path}")
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     
@@ -122,7 +174,7 @@ def load_model(model: nn.Module, path: str):
     is_eagle = 'eagle' in path.lower()
     
     if is_eagle:
-        load_eagle_model(model, path, packed_modules_mapping)
+        load_eagle_model(model, path, packed_modules_mapping, target_path=target_path)
     else:
         load_safetensors_model(model, path, packed_modules_mapping)
 
