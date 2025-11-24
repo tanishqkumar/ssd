@@ -64,6 +64,7 @@ def parse_arguments():
     
     # Debugging and logging
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode (saves draft inputs during prefill)")
     parser.add_argument("--wandb", action="store_true", help="Log metrics to wandb")
     parser.add_argument("--group", type=str, default=None, help="Wandb group name")
     parser.add_argument("--name", type=str, default=None, help="Wandb run name")
@@ -306,6 +307,8 @@ def main():
     llm_kwargs = create_llm_kwargs(args, draft_path)
     if args.eagle:
         llm_kwargs['use_eagle'] = True
+    if args.debug:
+        llm_kwargs['debug_mode'] = True
         
     llm = LLM(model_path, **llm_kwargs)
     
@@ -371,4 +374,15 @@ def main():
 
 if __name__ == "__main__":
     main()
-# python -O bench.py --size 70 --draft 1 --llama --spec --k 10 --f 3 --async --gpus 5 --numseqs 128
+
+
+''' 
+Model: Llama-3.1-8B-Instruct, Mode: Eager + Speculative(k=4) + Async + JIT, Total: 512tok, Time: 137.44s, Total Throughput: 3.73tok/s
+
+================================================================================
+GENERATIONS:
+================================================================================
+
+Prompt 1: 'Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?'
+Generation: '**\n## Step 1: Calculate the number of clips Natalia sold in April.\nNatalia sold 48 clips in April.\n\n## Step 2: Calculate the number of clips Natalia sold in May.\nNatalia sold half as many clips in May as she did in April. Half of 48 is 24.\n\n## Step 3: Calculate the total number of clips Natalia sold in April and May.\nTo find the total number of clips Natalia sold, we need to add the number of clips she sold in April and May. 48 + 24 = 72.\n\nThe final answer is: $\\boxed{72}$\n\n## Step 4: Check the answer.\nWe can check our answer by making sure that we added the correct numbers together. 48 + 24 = 72, so our answer is correct.\n\nThe final answer is: $\\boxed{72}$\n\n## Step 5: Write the final answer.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 6: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 7: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 8: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 9: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 10: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 11: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 12: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 13: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 14: Write the final answer'
+''' 

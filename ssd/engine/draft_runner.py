@@ -216,14 +216,6 @@ class DraftRunner(ModelRunner):
                 rec_token = request_keys[i, 2].item()
                 rec_text = self.tokenizer.decode([rec_token])
                 print(f"  Req {i}: token={rec_token} ('{rec_text}')", flush=True)
-            
-            print(f"[hit_cache_and_respond] Cache: {self.tree_cache_keys.shape[0]} entries", flush=True)
-            if self.tree_cache_keys.numel() > 0:
-                cache_sample = self.tree_cache_keys[:min(3, self.tree_cache_keys.shape[0])]
-                for i, key in enumerate(cache_sample):
-                    seq_id, k_idx, rec_token = key.tolist()
-                    rec_text = self.tokenizer.decode([rec_token])
-                    print(f"    [{i}]: token={rec_token} ('{rec_text}')", flush=True)
         
         if self.tree_cache_keys.numel() > 0:
             # Vectorized membership against tensor cache
@@ -234,6 +226,22 @@ class DraftRunner(ModelRunner):
             
             if self.config.verbose:
                 print(f"[hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
+                print(f"[hit_cache_and_respond] Cache: {self.tree_cache_keys.shape[0]} entries", flush=True)
+                
+                # Build set of hit cache indices for marking
+                hit_indices = set()
+                if cache_hits.any():
+                    idx = match.float().argmax(dim=1).to(torch.int64)
+                    for i in range(B):
+                        if cache_hits[i]:
+                            hit_indices.add(idx[i].item())
+                
+                # Print cache entries with hit markers
+                for i, key in enumerate(self.tree_cache_keys):
+                    seq_id, k_idx, rec_token = key.tolist()
+                    rec_text = self.tokenizer.decode([rec_token])
+                    hit_marker = "[HIT]" if i in hit_indices else ""
+                    print(f"    [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
             
             # Fill hits
             if (cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate):
@@ -505,36 +513,15 @@ class DraftRunner(ModelRunner):
             target_acts = partial_tree_decode_args["target_recovery_activations"]
             prev_acts = partial_tree_decode_args["previous_activations"]
             assert target_acts is not None
+            assert prev_acts is not None, "prev_acts must be provided when use_eagle is True"
             
-            if self.config.verbose:
-                print(f'[_build_tree_batch EAGLE] B={B}, K={K}, hidden_size={hidden_size}')
-                print(f'[_build_tree_batch EAGLE] target_acts.shape={target_acts.shape}')
-                if prev_acts is not None:
-                    print(f'[_build_tree_batch EAGLE] prev_acts.shape={prev_acts.shape}')
-                else:
-                    print(f'[_build_tree_batch EAGLE] prev_acts is None')
-            
-            glue_hidden_states = torch.zeros(B * (K+1), hidden_size,
+            glue_hidden_states = torch.empty(B * (K+1), hidden_size,
                                              dtype=self.hf_config.torch_dtype, device=self.device)
+    
             
-            if self.config.verbose:
-                print(f'[_build_tree_batch EAGLE] glue_hidden_states.shape (before filling)={glue_hidden_states.shape}')
-            
-            glue_hidden_states[::K+1] = self.model.fc(target_acts)
-            
-            if self.config.verbose:
-                print(f'[_build_tree_batch EAGLE] glue_hidden_states[::K+1] filled with fc(target_acts)')
-            
-            if prev_acts is not None:
-                glue_hs_view = glue_hidden_states.view(B, K+1, -1)
-                if self.config.verbose:
-                    print(f'[_build_tree_batch EAGLE] glue_hs_view.shape={glue_hs_view.shape}')
-                glue_hs_view[:, 1:, :] = prev_acts
-                if self.config.verbose:
-                    print(f'[_build_tree_batch EAGLE] glue_hs_view[:, 1:, :] filled with prev_acts')
-            
-            if self.config.verbose:
-                print(f'[_build_tree_batch EAGLE] final glue_hidden_states.shape={glue_hidden_states.shape}')
+            glue_hs_view = glue_hidden_states.view(B, K+1, -1)
+            glue_hs_view[:, 0, :] = self.model.fc(target_acts)
+            glue_hs_view[:, 1:, :] = prev_acts
 
         set_context(
             is_prefill=False,
