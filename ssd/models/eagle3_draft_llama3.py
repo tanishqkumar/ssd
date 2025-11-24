@@ -89,6 +89,8 @@ class Eagle3Attention(nn.Module):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Ensure all inputs to attn are contiguous
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o)
@@ -146,8 +148,9 @@ class Eagle3DecoderLayer(nn.Module):
         normed_conditioning = self.conditioning_feature_ln(conditioning_features)
         hidden_states = torch.cat([normed_tokens, normed_conditioning], dim=-1)
         
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, token_embeddings)
+        hidden_states = self.self_attn(positions, hidden_states) 
+        # use conditioning features as residual stream, not token embeddings, as per SAFEAILab ref impl
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, conditioning_features) 
         hidden_states = self.mlp(hidden_states) + residual
         return hidden_states 
 
@@ -225,6 +228,7 @@ class Eagle3DraftForCausalLM(nn.Module):
         draft_async: bool = False,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int = 1,
+        debug_mode: bool = False,
     ) -> None:
         super().__init__()
 
@@ -246,10 +250,12 @@ class Eagle3DraftForCausalLM(nn.Module):
         self.t2d = {}  # loaded by loader.py, converted to tensor after load_model
         self.d2t_tensor = None  # will be set after load_model
         self.t2d_tensor = None  # will be set after load_model
+        self.debug_mode = debug_mode
+        self._debug_saved = False  # Track if we've already saved debug data
         assert not (tp_group is None and self.tp_size > 1), "ERROR in LlamaForCausalLM: tp_group is None and tp_size > 1"
 
         print(f'Starting Eagle3DraftForCausalLM init, draft={draft}, speculate={speculate}, spec_k={spec_k}')
-        self.fc = nn.Linear(len(self.eagle_layers) * d_model_target, config.hidden_size)
+        self.fc = nn.Linear(len(self.eagle_layers) * d_model_target, config.hidden_size, bias=False)
         self.final_norm = RMSDNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.model = Eagle3DraftModel(config, draft, speculate, spec_k, async_fan_out, draft_async, use_eagle=use_eagle, eagle_layers=eagle_layers, tp_group=tp_group, tp_size=self.tp_size)
         self.lm_head = ParallelLMHead(
@@ -271,6 +277,11 @@ class Eagle3DraftForCausalLM(nn.Module):
     ) -> torch.Tensor:
         # Only project if this is target hidden states (3 * d_model_target dimension)
         if hidden_states.shape[-1] == 3 * self.d_model_target:
+            # This is the first prefill with target activations
+            if self.debug_mode and not self._debug_saved and input_ids.shape[0] != 2048:
+                self._save_debug_inputs(input_ids, positions, hidden_states)
+                self._debug_saved = True
+            
             hidden_states_projected = self.fc(hidden_states)  # [num_tokens, d_model_draft]
         else:
             hidden_states_projected = hidden_states # draft self-conditioning output, already d_model_draft from prenorm 
@@ -278,6 +289,28 @@ class Eagle3DraftForCausalLM(nn.Module):
         # Forward through draft model with conditioning
         prenorm = self.model(input_ids, hidden_states_projected, positions)
         return prenorm
+    
+    def _save_debug_inputs(self, input_ids: torch.Tensor, positions: torch.Tensor, target_hidden_states: torch.Tensor):
+        """Save draft prefill inputs for debugging."""
+        import os
+        # Get token embeddings
+        with torch.no_grad():
+            token_embeddings = self.model.embed_tokens(input_ids)
+        
+        debug_data = {
+            'input_ids': input_ids.cpu(),
+            'positions': positions.cpu(),
+            'target_hidden_states': target_hidden_states.cpu(),  # [num_tokens, 3 * d_model_target]
+            'token_embeddings': token_embeddings.cpu(),
+            'd_model_target': self.d_model_target,
+            'eagle_layers': self.eagle_layers,
+        }
+        
+        os.makedirs('debug_outputs', exist_ok=True)
+        save_path = 'debug_outputs/draft_prefill_inputs.pt'
+        torch.save(debug_data, save_path)
+        print(f"[DEBUG] Saved draft prefill inputs to {save_path}")
+        print(f"[DEBUG] Shapes: input_ids={input_ids.shape}, positions={positions.shape}, target_hidden_states={target_hidden_states.shape}, token_embeddings={token_embeddings.shape}")
 
 
     def compute_logits(

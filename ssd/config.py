@@ -43,6 +43,7 @@ class Config:
     
     device: torch.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     verbose: bool = False 
+    debug_mode: bool = False 
 
     @property
     def max_blocks(self): 
@@ -73,7 +74,7 @@ class Config:
             if self.eagle_layers is None:
                 L = self.hf_config.num_hidden_layers
                 # self.eagle_layers = [3, L//2, L-3]
-                self.eagle_layers = [2, L//2, L-3]
+                self.eagle_layers = [2, L//2, L-3] # [2, 16, 29] outputs, ie. [3, L//2+1, L-2] inputs
                 print(f'[Config] just set eagle_layers={self.eagle_layers}', flush=True)
         
         assert self.max_num_batched_tokens >= self.max_model_len

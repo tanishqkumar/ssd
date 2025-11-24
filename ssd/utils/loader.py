@@ -9,8 +9,14 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
-def load_embedding_from_target(model: nn.Module, target_path: str) -> bool:
+def load_embedding_from_target(model: nn.Module, target_path: str, target_hidden_size: int = None, draft_hidden_size: int = None) -> bool:
     """Try to load embedding weights from target model path (safetensors or bin)"""
+    # Only load target embeddings if hidden sizes match (or if sizes not provided, assume compatible)
+    if target_hidden_size is not None and draft_hidden_size is not None:
+        if target_hidden_size != draft_hidden_size:
+            print(f"[load_model] Skipping target embeddings: target hidden_size={target_hidden_size} != draft hidden_size={draft_hidden_size}")
+            return False
+    
     target_keys = ["model.embed_tokens.weight", "embed_tokens.weight"]
     
     # Try safetensors first
@@ -55,14 +61,34 @@ def load_embedding_from_target(model: nn.Module, target_path: str) -> bool:
     return False
 
 
-def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, target_path: str = None):
-    """Load EAGLE3 draft model weights from pytorch_model.bin"""
-    print(f"[load_model] Detected EAGLE3 draft model, loading from pytorch_model.bin")
-    bin_file = os.path.join(path, "pytorch_model.bin")
-    if not os.path.exists(bin_file):
-        raise FileNotFoundError(f"Expected pytorch_model.bin at {bin_file} for EAGLE3 draft model")
+def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, target_path: str = None, target_hidden_size: int = None):
+    """Load EAGLE3 draft model weights from safetensors or pytorch_model.bin"""
+    # Try safetensors first
+    safetensor_files = glob(os.path.join(path, "*.safetensors"))
+    state_dict = None
     
-    state_dict = torch.load(bin_file, map_location="cpu")
+    if safetensor_files:
+        print(f"[load_model] Detected EAGLE3 draft model, trying safetensors first")
+        # Load all safetensors into a single state dict
+        state_dict = {}
+        for file in safetensor_files:
+            try:
+                with safe_open(file, "pt", "cpu") as f:
+                    for key in f.keys():
+                        state_dict[key] = f.get_tensor(key)
+                print(f"[load_model] Loaded {len(state_dict)} weights from {file}")
+                break  # For EAGLE, typically just one file
+            except Exception as e:
+                print(f"[load_model] Error reading safetensor {file}: {e}")
+                continue
+    
+    # Fall back to pytorch_model.bin if safetensors didn't work
+    if state_dict is None or len(state_dict) == 0:
+        print(f"[load_model] Loading EAGLE3 draft model from pytorch_model.bin")
+        bin_file = os.path.join(path, "pytorch_model.bin")
+        if not os.path.exists(bin_file):
+            raise FileNotFoundError(f"No safetensors or pytorch_model.bin found at {path} for EAGLE3 draft model")
+        state_dict = torch.load(bin_file, map_location="cpu")
     
     # Load d2t and t2d dictionaries
     if hasattr(model, 'd2t') and 'd2t' in state_dict:
@@ -88,7 +114,13 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
                 break
     
     if not found_embed_tokens:
-        if target_path:
+        if target_path and target_hidden_size is not None:
+            draft_hidden_size = model.config.hidden_size
+            print(f"[load_model] 'embed_tokens' not found in draft weights. Attempting to load from target path: {target_path}")
+            if load_embedding_from_target(model, target_path, target_hidden_size, draft_hidden_size):
+                found_embed_tokens = True
+        elif target_path:
+            # For backward compatibility - if target_hidden_size not provided, try anyway (8B case)
             print(f"[load_model] 'embed_tokens' not found in draft weights. Attempting to load from target path: {target_path}")
             if load_embedding_from_target(model, target_path):
                 found_embed_tokens = True
@@ -110,6 +142,8 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
         # Skip the dictionary tensors as we've already processed them
         if weight_name in ['d2t', 't2d']:
             continue
+        
+        print(f'[load_model] loading weight {weight_name} with shape {loaded_weight.shape}')
         
         # Check if this weight should use packed module loading
         is_packed = False
@@ -136,6 +170,9 @@ def load_eagle_model(model: nn.Module, path: str, packed_modules_mapping: dict, 
         elif weight_name == 'norm.weight':
             # norm.weight -> final_norm.weight
             param_name = 'final_norm.weight'
+        elif weight_name == 'embed_tokens.weight':
+            # embed_tokens.weight -> model.embed_tokens.weight
+            param_name = 'model.embed_tokens.weight'
         else:
             # fc.weight and lm_head.weight stay the same
             param_name = weight_name
@@ -166,7 +203,7 @@ def load_safetensors_model(model: nn.Module, path: str, packed_modules_mapping: 
                     weight_loader(param, f.get_tensor(weight_name))
 
 
-def load_model(model: nn.Module, path: str, target_path: str = None):
+def load_model(model: nn.Module, path: str, target_path: str = None, target_hidden_size: int = None):
     print(f"[load_model] loading model from {path}")
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     
@@ -174,7 +211,7 @@ def load_model(model: nn.Module, path: str, target_path: str = None):
     is_eagle = 'eagle' in path.lower()
     
     if is_eagle:
-        load_eagle_model(model, path, packed_modules_mapping, target_path=target_path)
+        load_eagle_model(model, path, packed_modules_mapping, target_path=target_path, target_hidden_size=target_hidden_size)
     else:
         load_safetensors_model(model, path, packed_modules_mapping)
 
