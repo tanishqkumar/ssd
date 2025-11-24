@@ -238,6 +238,7 @@ class ModelRunner:
             
         if model_class == Eagle3DraftForCausalLM:
             kwargs['d_model_target'] = config.d_model_target
+            kwargs['debug_mode'] = config.debug_mode
             
         self.model = model_class(**kwargs)
 
@@ -247,7 +248,8 @@ class ModelRunner:
         
         # Pass tokenizer_path as target_path if it's available (mostly for Eagle draft)
         target_path = getattr(config, 'tokenizer_path', None)
-        load_model(self.model, config.model, target_path=target_path)
+        target_hidden_size = getattr(config, 'd_model_target', None)
+        load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
             self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
