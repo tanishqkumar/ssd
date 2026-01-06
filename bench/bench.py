@@ -38,7 +38,7 @@ def parse_arguments():
     parser.add_argument("--dtemp", type=float, default=None, help="Draft async temperature (overrides --temp for async tree decode)")
     parser.add_argument("--ttemp", type=float, default=None, help="Target async temperature (overrides --temp for async verify)")
     parser.add_argument("--afn", dest="afn", action="store_true", help="Enable adaptive fan-out (skip top-1 for 0<k<K)")
-    parser.set_defaults(afn=False)
+    parser.set_defaults(afn=False) # warning: do not use `afn` it is deprecated 
     parser.add_argument("--jit", action="store_true", help="Enable JIT speculative decoding")
     
     # Memory and batching configuration
@@ -51,7 +51,7 @@ def parse_arguments():
     parser.add_argument("--output_len", type=int, default=512, help="Maximum output length")
     parser.add_argument("--numseqs", type=int, default=128, help="Number of sequences to generate")
     parser.add_argument("--temp", type=float, default=0.0, help="Temperature for generation")
-    parser.add_argument("--x", type=float, default=None, help="Sampler x for generation")
+    parser.add_argument("--x", type=float, default=None, help="Sampler x for generation (Saguaro sampling coefficient)")
     
     # Example mode
     parser.add_argument("--example", action="store_true", help="Use real prompts like in example.py and print generations (supports up to batch size 8)")
@@ -375,14 +375,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-''' 
-Model: Llama-3.1-8B-Instruct, Mode: Eager + Speculative(k=4) + Async + JIT, Total: 512tok, Time: 137.44s, Total Throughput: 3.73tok/s
-
-================================================================================
-GENERATIONS:
-================================================================================
-
-Prompt 1: 'Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?'
-Generation: '**\n## Step 1: Calculate the number of clips Natalia sold in April.\nNatalia sold 48 clips in April.\n\n## Step 2: Calculate the number of clips Natalia sold in May.\nNatalia sold half as many clips in May as she did in April. Half of 48 is 24.\n\n## Step 3: Calculate the total number of clips Natalia sold in April and May.\nTo find the total number of clips Natalia sold, we need to add the number of clips she sold in April and May. 48 + 24 = 72.\n\nThe final answer is: $\\boxed{72}$\n\n## Step 4: Check the answer.\nWe can check our answer by making sure that we added the correct numbers together. 48 + 24 = 72, so our answer is correct.\n\nThe final answer is: $\\boxed{72}$\n\n## Step 5: Write the final answer.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 6: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 7: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 8: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 9: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 10: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 11: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 12: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 13: Write the final answer in the correct format.\nThe final answer is: $\\boxed{72}$\n\nThe final answer is: $\\boxed{72}$\n\n## Step 14: Write the final answer'
-''' 
