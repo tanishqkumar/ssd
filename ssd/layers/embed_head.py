@@ -78,10 +78,19 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor, last_only: bool = True): # x is always [nt = B*S, D] -> [nt, V]
         context = get_context()
         if context.cu_seqlens_q is not None:  # mq decode (prefill, glue, verify, tree decode)
-            if context.is_prefill: # last_only in prefill 
-                # [nt, D] -> [b, D] which later becomes [b, V]
-                last_indices = context.cu_seqlens_q[1:] - 1
-                x = x[last_indices].contiguous()
+            if context.is_prefill:
+                if last_only:
+                    # [nt, D] -> [b, D] which later becomes [b, V]
+                    last_indices = context.cu_seqlens_q[1:] - 1
+                    x = x[last_indices].contiguous()
+                else:
+                    # Return logits for all tokens in prefill
+                    flat_logits = F.linear(x, self.weight)
+                    if self.tp_size > 1:
+                        parts = [torch.empty_like(flat_logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+                        dist.gather(flat_logits, parts, 0, group=self.tp_group)
+                        flat_logits = torch.cat(parts, dim=-1) if self.tp_rank == 0 else None
+                    return flat_logits
             else: # multi-query decode path (glue, verify, tree)
                 # assume constant query len and reshape
                 batch_size = context.cu_seqlens_q.size(0) - 1
