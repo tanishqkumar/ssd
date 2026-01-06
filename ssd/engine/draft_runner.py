@@ -94,19 +94,24 @@ class DraftRunner(ModelRunner):
 
         # 6) run the draft model in prefill mode
         if self.config.use_eagle:
-            logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=True, hidden_states=eagle_acts)
+            num_last = 3  # Number of last positions to show
+            logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=bool(num_last == 1), hidden_states=eagle_acts)
             
             # Debug logging: show draft predictions after prefill
             print(f'[draft_async_prefill] DRAFT PREFILL DONE', flush=True)
             print(f'[draft_async_prefill] Draft predictions after prefill:', flush=True)
             
             # Get top-5 logits for each sequence
-            top5_logits, top5_indices = logits.topk(5, dim=-1)  # [batch_size, 5]
-            for i in range(logits.shape[0]):
-                top5_tokens = top5_indices[i].tolist()
-                top5_values = top5_logits[i].tolist()
+            # Get the last 3 token positions for each sequence
+            num_positions = min(num_last, logits.shape[0])
+            start_idx = max(0, logits.shape[0] - num_positions)
+            
+            for i in range(start_idx, logits.shape[0]):
+                top5_logits, top5_indices = logits[i].topk(5, dim=-1)  # [5]
+                top5_tokens = top5_indices.tolist()
+                top5_values = top5_logits.tolist()
                 top5_texts = [self.tokenizer.decode([tok]) for tok in top5_tokens]
-                print(f'  Seq {i} top-5:', flush=True)
+                print(f'  Position {i} (last {logits.shape[0] - i}) top-5:', flush=True)
                 for rank, (tok_id, tok_val, tok_text) in enumerate(zip(top5_tokens, top5_values, top5_texts)):
                     print(f'    {rank+1}. token_id={tok_id}, logit={tok_val:.3f}, text={repr(tok_text)}', flush=True)
         else:
@@ -136,8 +141,8 @@ class DraftRunner(ModelRunner):
         
         input_ids = request_keys[:, -1]
         pos_offset = -1 if self.config.use_eagle else 0
-        positions = num_tokens - 1 + pos_offset
-        context_lens = num_tokens + pos_offset
+        positions = num_tokens - 1 + pos_offset # want to write rec token at post N-1 since [0, ..., N-2] filled by prefill 
+        context_lens = num_tokens + pos_offset # N+1
         # Calculate slot mapping vectorized
         block_idx = positions // self.block_size
         pos_in_block = positions % self.block_size

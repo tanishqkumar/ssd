@@ -42,7 +42,7 @@ def main():
     # Generation parameters
     parser.add_argument("--input_len", type=int, default=128,
                         help="Prompt length in tokens")
-    parser.add_argument("--output_len", type=int, default=512, # was 256 
+    parser.add_argument("--output_len", type=int, default=256, 
                         help="New tokens to generate per request")
     parser.add_argument("--numseqs", type=int, default=1,
                         help="Number of requests to generate (batch size)")
@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--b", type=int, default=1,
                         help="Max in-flight sequences")
     parser.add_argument("--gpu-mem-util", type=float,
-                        default=0.8, help="GPU memory utilization (0-1)")
+                        default=0.9, help="GPU memory utilization (0-1)")
 
     # Dataset selection
     parser.add_argument("--example", action="store_true",
@@ -138,7 +138,7 @@ def main():
         "tp_size": args.gpus,
         "mem_fraction_static": args.gpu_mem_util,
         "cuda_graph_max_bs": 1,
-        # "disable_cuda_graph": True,
+        "disable_cuda_graph": True,
         "max_running_requests": args.b,
     }
 
@@ -149,8 +149,8 @@ def main():
         
         # For EAGLE3, use specific draft models based on target size
         if args.spec_algo == "EAGLE3":
-            engine_args["disable_custom_all_reduce"] = True
-            engine_args["dtype"] = "float16"
+            # engine_args["disable_custom_all_reduce"] = True
+            engine_args["dtype"] = "bfloat16"
             os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
             if not args.llama:
                 raise ValueError("EAGLE3 requires --llama flag to be set")
