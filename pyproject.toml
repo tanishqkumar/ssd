@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssd"
+version = "0.2.0"
+authors = [{ name = "Tanishq Kumar" }]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+description = "Async tree-based speculative decoding research engine"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.51.0",
+    "xxhash",
+    "numpy",
+    "safetensors",
+    "tqdm",
+    "flashinfer>=0.2.0",
+    "sgl-kernel",
+]
+
+[project.urls]
+Homepage="https://github.com/tanishqkumar/ssd"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ssd*"]
