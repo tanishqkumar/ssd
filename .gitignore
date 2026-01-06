@@ -224,4 +224,6 @@ wandb_runs/
 *.toml 
 *.md
 !README.md
-docs/ 
+docs/ eagle_details.md
+eagle_details2.md
+eagle3_comparison.md
