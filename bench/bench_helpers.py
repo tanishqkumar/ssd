@@ -7,11 +7,11 @@ from transformers import AutoTokenizer
 
 # Dataset file paths on local system
 DATASET_PATHS = {
-    "humaneval": "/data/tkumar/huggingface/datasets/processed_datasets/humaneval/humaneval_data_10000.jsonl",
-    "alpaca": "/data/tkumar/huggingface/datasets/processed_datasets/alpaca/alpaca_data_10000.jsonl",
-    "c4": "/data/tkumar/huggingface/datasets/processed_datasets/c4/c4_data_10000.jsonl",
-    "gsm": "/data/tkumar/huggingface/datasets/processed_datasets/gsm8k/gsm8k_data_10000.jsonl",
-    "ultrafeedback": "/data/tkumar/huggingface/datasets/processed_datasets/ultrafeedback/ultrafeedback_data_10000.jsonl",
+    "humaneval": "/data/tkumar/huggingface/processed_datasets/humaneval/humaneval_data_10000.jsonl",
+    "alpaca": "/data/tkumar/huggingface/processed_datasets/alpaca/alpaca_data_10000.jsonl",
+    "c4": "/data/tkumar/huggingface/processed_datasets/c4/c4_data_10000.jsonl",
+    "gsm": "/data/tkumar/huggingface/processed_datasets/gsm8k/gsm8k_data_10000.jsonl",
+    "ultrafeedback": "/data/tkumar/huggingface/processed_datasets/ultrafeedback/ultrafeedback_data_10000.jsonl",
 }
 
 
