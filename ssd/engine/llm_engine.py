@@ -1,5 +1,6 @@
 import os
 os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0'  # for FlashInfer
+
 from ssd.engine.helpers.handshake_helpers import TargetDraftHandshake
 from ssd.config import Config
 from ssd.sampling_params import SamplingParams
@@ -10,6 +11,7 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.engine.draft_runner import DraftRunner
 from ssd.engine.helpers.runner_helpers import prepare_prefill_tensors_from_seqs
 from ssd.utils.verify import verify
+
 import atexit
 from dataclasses import fields
 from time import perf_counter
@@ -170,7 +172,6 @@ class LLMEngine:
 
     # make and send [cache_keys, num_tokens, dbt, temps] tensors, since no Seq objects can be sent via NCCL
     # recv [cache_hits, spec_tokens_flat, logits_q], contract specified in handshake_helpers.py
-        # this bounds the difference 
     def target_draft_handshake(self, seqs_copy: list[Sequence]):
         """Send a spec request command with cache keys to get speculations/logits."""
         draft_runner_rank = self.num_tp_gpus
@@ -490,6 +491,7 @@ class LLMEngine:
         result = self.model_runner.call("run", seqs, True)
         if self.config.use_eagle:
             assert isinstance(result, tuple), "result must be a tuple when use_eagle is True"
+            assert self.config.draft_async, "Eagle requires async to be true..."
             token_ids, eagle_acts = result
             print(f'[spec_prefill] target prefill with eagle, got TUPLE result about to fire and forget draft prefill', flush=True)
             
@@ -497,6 +499,7 @@ class LLMEngine:
             for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
                 seq.recovery_token_id = token_id
                 seq_len = seq.num_prompt_tokens
+                # this doesn't move acts onto cpu does it? 
                 seq.last_target_hidden_state = eagle_acts[offset + seq_len - 1].clone()
                 offset += seq_len
             
@@ -505,7 +508,13 @@ class LLMEngine:
             token_ids = result
             for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
                 seq.recovery_token_id = token_id
-            self.async_draft_prefill_remote(seqs, None)
+            
+            # Only call async_draft_prefill_remote for async spec
+            if self.config.draft_async:
+                self.async_draft_prefill_remote(seqs, None)
+            else:
+                # Sync spec: prefill draft model locally (ignore sampled tokens, just building KV cache)
+                self.draft_runner.call("run", seqs, True)
 
         # recovery token will be first token in next fwd, but not yet in kvc of either model
         for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
