@@ -179,8 +179,8 @@ def main():
     elif prompt_token_ids is not None:
         # Convert token IDs back to strings using tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        prompts = [tokenizer.decode(token_ids, skip_special_tokens=True)
-                   for token_ids in prompt_token_ids]
+        prompts = [tokenizer.decode(token_ids, skip_special_tokens=False)
+                    for token_ids in prompt_token_ids]
     else:
         raise ValueError("No prompts generated")
 
