@@ -176,8 +176,17 @@ def load_dataset_token_ids(
                     break
                 data = json.loads(line.strip())
                 text: str = data["text"]
-                tokens = tokenizer.encode(text, add_special_tokens=False)
+                # tokens = tokenizer.encode(text, add_special_tokens=False)
+                
+                formatted = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": text}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                tokens = tokenizer.encode(formatted, add_special_tokens=False)
+
                 target_len = max(len(tokens), input_len)
+                
                 if len(tokens) >= target_len:
                     truncated_tokens = tokens[:target_len]
                 else:
