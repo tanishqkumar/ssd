@@ -8,8 +8,6 @@ def verify(
     speculations: torch.Tensor,
     temperatures_target,
     temperatures_draft,
-    config: Config,
-    cache_hits: torch.Tensor | None = None,
 ) -> tuple[list[list[int]], list[int]]:
     """
     Speculative‐decoding verification:
@@ -24,8 +22,6 @@ def verify(
     device = logits_p.device
     B, Kp1, V = logits_p.shape
     K = Kp1 - 1
-
-    F, sampler_x = config.async_fan_out, config.sampler_x
 
     # 1) Greedy argmax paths (for all, we precompute preds_p)
     # ------------------------------------------------------
@@ -57,11 +53,7 @@ def verify(
     # AND be cache hits (i.e., tokens were actually sampled from q).
     base_ratio_rows = ((temps_t > 0) | (temps_q > 0))
     
-    # TODO: understanding why we gate on cache_hits is important, maybe cause of our --x not working 
-    if config.jit_speculate:
-        ratio_rows = base_ratio_rows
-    else:
-        ratio_rows = base_ratio_rows & (cache_hits.to(torch.bool) if cache_hits is not None else torch.zeros_like(base_ratio_rows, dtype=torch.bool))
+    ratio_rows = base_ratio_rows
     do_any_ratio = ratio_rows.any().item()
 
     # We need probs_p for recovery sampling whenever any temps_t>0 exists,
@@ -99,11 +91,6 @@ def verify(
             one_hot_q = torch.zeros_like(logits_q[z_q], dtype=torch.float32)
             one_hot_q.scatter_(2, argmax_q.unsqueeze(-1), 1.0)
             probs_q[z_q] = one_hot_q
-
-        # Apply sampler_x rescaling to draft distribution if provided
-        if sampler_x is not None: 
-            assert F is not None, "F must be provided if sampler_x is provided"
-            probs_q = apply_sampler_x_rescaling(probs_q, sampler_x, F)
 
         # gather p_i(x_i) and q_i(x_i) for i=1..K on rows doing ratio
         p_all = probs_p[:, :K, :] if probs_p is not None else torch.zeros(B, K, V, device=device, dtype=torch.float32)

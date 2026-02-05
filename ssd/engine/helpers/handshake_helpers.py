@@ -4,32 +4,47 @@ import torch.distributed as dist
 from ssd.engine.sequence import Sequence
 from ssd.utils.async_helpers.nccl_pack import send_int64, recv_int64
 
+
 class TargetDraftHandshake:
     """Handles the complete handshake protocol between target and draft runners."""
     
-    def __init__(self, seqs: list[Sequence], config, async_pg, draft_runner_rank):
+    def __init__(
+        self,
+        seqs: list[Sequence],
+        lookahead: int,
+        async_fan_out: int,
+        max_blocks: int,
+        eagle: bool,
+        vocab_size: int,
+        draft_dtype: torch.dtype,
+        device: torch.device,
+        async_pg: dist.ProcessGroup,
+        draft_runner_rank: int,
+    ):
         # Input validation for non-obvious requirements
         assert len(seqs) > 0, "seqs must be non-empty"
         assert async_pg is not None, "async_pg (process group) cannot be None"
         
         self.seqs = seqs
-        self.config = config
+        self.B = len(seqs)
+        self.K = lookahead
+        self.F = async_fan_out
+        self.max_blocks = max_blocks
+        self.eagle = eagle
+        self.vocab_size = vocab_size
+        self.draft_dtype = draft_dtype
+        self.device = device
         self.async_pg = async_pg
         self.draft_runner_rank = draft_runner_rank
-        self.device = config.device
-        self.B = len(seqs)
-        self.K = config.speculate_k
-        self.F = config.async_fan_out
-        
+
         # Validate critical sequence state that's not obvious from type hints
         for i, seq in enumerate(seqs):
             assert seq.recovery_token_id is not None, f"seq[{i}].recovery_token_id cannot be None - required for cache key generation"
-            assert len(seq.draft_block_table) <= config.max_blocks, f"seq[{i}].draft_block_table length ({len(seq.draft_block_table)}) exceeds max_blocks ({config.max_blocks})"
+            assert len(seq.draft_block_table) <= self.max_blocks, f"seq[{i}].draft_block_table length ({len(seq.draft_block_table)}) exceeds max_blocks ({self.max_blocks})"
         
-        # Prepare payload data
-        self._prepare_payload()
+        self._prepare_request_payload()
     
-    def _prepare_payload(self):
+    def _prepare_request_payload(self):
         """Prepare handshake information for draft tree cache RPC."""
         # Build cache keys - shape contract: [B, 3] where columns are [seq_id, keep_idx, recovery_token]
         seq_ids = torch.tensor([s.seq_id for s in self.seqs], device=self.device)
@@ -42,23 +57,18 @@ class TargetDraftHandshake:
             [seq.num_tokens for seq in self.seqs], dtype=torch.int64, device=self.device)  # [B]
         
         # Draft-side temperatures for tree decode: prefer per-seq override, else global config override, else seq.temperature
-        temps_draft = []
-        for seq in self.seqs:
-            if getattr(seq, 'draft_async_temperature', None) is not None:
-                temps_draft.append(seq.draft_async_temperature)
-            elif self.config.draft_async_temp is not None:
-                temps_draft.append(self.config.draft_async_temp)
-            else:
-                temps_draft.append(seq.temperature)
-
-        self.temperatures = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)  # [B]
+        self.temperatures = torch.tensor(
+            [seq.temperature for seq in self.seqs],
+            dtype=torch.float32,
+            device=self.device,
+        )  # [B]
 
         # Prepare draft block tables - shape contract: [B, max_blocks] with -1 padding
         self.draft_block_tables = torch.tensor([seq.draft_block_table + [-1] * (  
-            self.config.max_blocks - len(seq.draft_block_table)) for seq in self.seqs], dtype=torch.int32, device=self.device)  # [B, max_blocks]
+            self.max_blocks - len(seq.draft_block_table)) for seq in self.seqs], dtype=torch.int32, device=self.device)  # [B, max_blocks]
         
         # Prepare recovery activations for EAGLE
-        if self.config.use_eagle:
+        if self.eagle:
             for i, seq in enumerate(self.seqs):
                 assert seq.last_target_hidden_state is not None, \
                     f"seq[{i}].last_target_hidden_state is None - must be set after prefill/verify"
@@ -72,7 +82,7 @@ class TargetDraftHandshake:
         assert self.cache_keys.shape == (self.B, 3), f"cache_keys shape mismatch: expected ({self.B}, 3), got {self.cache_keys.shape}"
         assert self.num_tokens.shape == (self.B,), f"num_tokens shape mismatch: expected ({self.B},), got {self.num_tokens.shape}"
         assert self.temperatures.shape == (self.B,), f"temperatures shape mismatch: expected ({self.B},), got {self.temperatures.shape}"
-        assert self.draft_block_tables.shape == (self.B, self.config.max_blocks), f"draft_block_tables shape mismatch: expected ({self.B}, {self.config.max_blocks}), got {self.draft_block_tables.shape}"
+        assert self.draft_block_tables.shape == (self.B, self.max_blocks), f"draft_block_tables shape mismatch: expected ({self.B}, {self.max_blocks}), got {self.draft_block_tables.shape}"
     
     def send_request(self):
         """Send the complete request: cmd, metadata, and payload."""
@@ -98,7 +108,7 @@ class TargetDraftHandshake:
         if self.recovery_activations is not None:
             dist.send(self.recovery_activations, dst=self.draft_runner_rank, group=self.async_pg)
     
-    def receive_response(self, draft_cfg):
+    def receive_response(self):
         """Receive the response: cache hits, speculations, and logits.
         
         Returns:
@@ -116,25 +126,19 @@ class TargetDraftHandshake:
 
         # Reshape spec tokens according to protocol contract: flat [B*K] -> [B, K]
         speculations = spec_tokens_flat.view(self.B, self.K)
-        
-        # Receive logits - shape contract: [B, K, V] where V is vocab_size
-        assert hasattr(draft_cfg, 'hf_config'), "draft_cfg must have hf_config attribute"
-        assert hasattr(draft_cfg.hf_config, 'vocab_size'), "draft_cfg.hf_config must have vocab_size attribute"
-        assert hasattr(draft_cfg.hf_config, 'torch_dtype'), "draft_cfg.hf_config must have torch_dtype attribute"
-        
+
         # Draft now returns full target vocab size logits (after d2t expansion)
-        V = draft_cfg.hf_config.vocab_size
-        logits_q = torch.empty(self.B, self.K, V, dtype=draft_cfg.hf_config.torch_dtype, device=self.device)
+        V = self.vocab_size
+        logits_q = torch.empty(self.B, self.K, V, dtype=self.draft_dtype, device=self.device)
         dist.recv(logits_q, src=self.draft_runner_rank, group=self.async_pg)
         
         # Post-condition shape validation
-        assert cache_hits.shape == (self.B,), f"cache_hits shape mismatch: expected ({self.B},), got {cache_hits.shape}"
         assert speculations.shape == (self.B, self.K), f"speculations shape mismatch: expected ({self.B}, {self.K}), got {speculations.shape}"
         assert logits_q.shape == (self.B, self.K, V), f"logits_q shape mismatch: expected ({self.B}, {self.K}, {V}), got {logits_q.shape}"
         
-        return cache_hits, speculations, logits_q
+        return speculations, logits_q
     
-    def execute_full_handshake(self, draft_cfg):
+    def execute_full_handshake(self):
         """Execute the complete handshake: send request and receive response."""
         self.send_request()
-        return self.receive_response(draft_cfg)
+        return self.receive_response()

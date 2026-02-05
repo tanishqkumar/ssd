@@ -6,7 +6,7 @@ import torch
 @dataclass
 class Config:
                 
-    model: str = "/data/tkumar/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
+    model: str = "/data/shared/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 1 
     max_model_len: int = 4096 
@@ -21,7 +21,7 @@ class Config:
     # spec config args
     draft_hf_config: AutoConfig | None = None
     speculate: bool = False 
-    draft: str = "/data/tkumar/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
+    draft: str = "/data/shared/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
     speculate_k: int = 1
     draft_async: bool = False 
     async_fan_out: int = 3

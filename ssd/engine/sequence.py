@@ -20,8 +20,7 @@ class Sequence:
         'num_prompt_tokens', 'num_cached_tokens', 'block_table', 
         'last_spec_step_accepted_len', 'draft_block_table', 
         'num_draft_cached_tokens', 'temperature', 'max_new_tokens', 
-        'ignore_eos', 'draft_async_temperature', 'target_async_temperature', 
-        'recovery_token_id', 'last_target_hidden_state'
+        'ignore_eos', 'recovery_token_id', 'last_target_hidden_state'
     ]
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
@@ -41,9 +40,6 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_new_tokens = sampling_params.max_new_tokens
         self.ignore_eos = sampling_params.ignore_eos
-        # Async-spec optional overrides
-        self.draft_async_temperature = sampling_params.draft_async_temperature
-        self.target_async_temperature = sampling_params.target_async_temperature
 
         self.recovery_token_id = None
         self.last_target_hidden_state = None
