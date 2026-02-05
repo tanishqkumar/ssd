@@ -371,7 +371,7 @@ class LLMEngine:
                     recovery_texts.append(text)
                 except Exception:
                     recovery_texts.append(f"<token_id:{token}>")
-            print(f"[verify] recovery tokens: {recovery_texts}", flush=True)
+            print(f"[BANANA][verify] recovery tokens: {recovery_texts}", flush=True)
         
         METRICS["accepted_suffix_lens_with_recovery"].extend(
             [len(s) for s in new_suffixes]) 
@@ -388,7 +388,7 @@ class LLMEngine:
         if new_suffixes:
             mean_suffix_len = sum(len(suffix)
                                   for suffix in new_suffixes) / len(new_suffixes)
-            if __debug__: print(f"[verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
+            if __debug__: print(f"[BANANA][verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
 
         if self.config.use_eagle:
             eagle_acts = eagle_acts_flat.view(batch_size, self.config.speculate_k + 1, -1)
