@@ -281,8 +281,6 @@ def main():
         temperature=args.temp,
         ignore_eos=True,
         max_new_tokens=args.output_len,
-        draft_async_temperature=(args.dtemp if getattr(args, 'async', False) and args.dtemp is not None else None),
-        target_async_temperature=(args.ttemp if getattr(args, 'async', False) and args.ttemp is not None else None),
     ) for _ in range(num_reqs)]
     
     # Print number of tokens in each input

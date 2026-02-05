@@ -55,6 +55,7 @@ class ModelRunner:
 
         assert self.hf_config is not None, "ERROR in ModelRunner: hf_config is None" # this implies boundedness to the end 
         
+        # TODO: Get rid of this.
         if self.is_draft:
             should_use_dist = self.config.draft_async
         else:
