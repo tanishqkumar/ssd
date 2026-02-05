@@ -1,4 +1,6 @@
 import torch
+from transformers import AutoTokenizer
+
 from ssd.engine.sequence import Sequence
 from ssd.engine.model_runner import ModelRunner
 from ssd.utils.verify import verify
@@ -6,9 +8,10 @@ from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, Ve
 
 
 class Verifier(VerifierBase):
-    def __init__(self, lookahead: int, device: torch.device, target_model_runner: ModelRunner):
+    def __init__(self, lookahead: int, device: torch.device, target_model_runner: ModelRunner, tokenizer: AutoTokenizer = None):
         super().__init__(lookahead, device)
         self.target_model_runner = target_model_runner
+        self.tokenizer = tokenizer
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
         # TODO: Eagle
@@ -66,17 +69,16 @@ class Verifier(VerifierBase):
         )
 
         # # Debug: print recovery tokens detokenized
-        # if __debug__ and recovery_tokens is not None and len(recovery_tokens) > 0:
-        #     tokenizer = self.tokenizer
-        #     recovery_texts = []
-        #     for token in recovery_tokens:
-        #         try:
-        #             text = tokenizer.decode([token], skip_special_tokens=False)
-        #             recovery_texts.append(text)
-        #         except Exception:
-        #             recovery_texts.append(f"<token_id:{token}>")
-        #     print(f"[verify] recovery tokens: {recovery_texts}", flush=True)
-        
+        if __debug__ and recovery_tokens is not None and len(recovery_tokens) > 0:
+            recovery_texts = []
+            for token in recovery_tokens:
+                try:
+                    text = self.tokenizer.decode([token], skip_special_tokens=False)
+                    recovery_texts.append(text)
+                except Exception:
+                    recovery_texts.append(f"<token_id:{token}>")
+            print(f"[BANANA][verify] recovery tokens: {recovery_texts}", flush=True)
+
         # METRICS["accepted_suffix_lens_with_recovery"].extend(
         #     [len(s) for s in new_suffixes]) 
 
@@ -92,7 +94,7 @@ class Verifier(VerifierBase):
         if new_suffixes:
             mean_suffix_len = sum(len(suffix)
                                   for suffix in new_suffixes) / len(new_suffixes)
-            if __debug__: print(f"[verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
+            if __debug__: print(f"[BANANA][verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
 
         eagle_acts = None
         if eagle:
