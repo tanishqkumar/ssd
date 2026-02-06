@@ -1,3 +1,4 @@
+from transformers import AutoTokenizer
 
 # Infer model family based on model path name
 def infer_model_family(model_path: str) -> str:
@@ -9,3 +10,13 @@ def infer_model_family(model_path: str) -> str:
             return "qwen"
         else:
             return "unknown"
+
+def decode_tokens(token_ids: list[int], tokenizer: AutoTokenizer) -> list[str]:
+    decoded = []
+    for token in token_ids:
+        try:
+            text = tokenizer.decode([token], skip_special_tokens=False)
+            decoded.append(text)
+        except Exception:
+            decoded.append(f"<token_id:{token}>")
+    return decoded

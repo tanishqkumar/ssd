@@ -43,7 +43,8 @@ class Config:
     
     device: torch.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     verbose: bool = False 
-    debug_mode: bool = False 
+    debug_mode: bool = False
+    max_steps: int | None = None
 
     @property
     def max_blocks(self): 

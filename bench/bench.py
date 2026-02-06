@@ -65,6 +65,7 @@ def parse_arguments():
     # Debugging and logging
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (saves draft inputs during prefill)")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum number of steps to run")
     parser.add_argument("--wandb", action="store_true", help="Log metrics to wandb")
     parser.add_argument("--group", type=str, default=None, help="Wandb group name")
     parser.add_argument("--name", type=str, default=None, help="Wandb run name")
@@ -150,6 +151,7 @@ def initialize_wandb(args, run_name):
             "all_mode": args.all,
             "sampler_x": args.x,
             "implementation": "nanovllm-internal",
+            "max_steps": args.max_steps,
         }
     )
 
