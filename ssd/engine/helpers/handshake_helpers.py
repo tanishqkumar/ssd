@@ -112,9 +112,9 @@ class TargetDraftHandshake:
         """Receive the response: cache hits, speculations, and logits.
         
         Returns:
-            cache_hits: [B] tensor of cache hit indicators
             speculations: [B, K] tensor of speculated tokens  
             logits_q: [B, K, V] tensor of draft model logits
+            cache_hits: [B] tensor of cache hit indicators
         """
         # Contract: recv_int64 expects exactly B + B*K elements for fused response
         expected_fused_size = self.B + self.B * self.K
@@ -136,7 +136,7 @@ class TargetDraftHandshake:
         assert speculations.shape == (self.B, self.K), f"speculations shape mismatch: expected ({self.B}, {self.K}), got {speculations.shape}"
         assert logits_q.shape == (self.B, self.K, V), f"logits_q shape mismatch: expected ({self.B}, {self.K}, {V}), got {logits_q.shape}"
         
-        return speculations, logits_q
+        return speculations, logits_q, cache_hits
     
     def execute_full_handshake(self):
         """Execute the complete handshake: send request and receive response."""

@@ -8,10 +8,24 @@ from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, Ve
 
 
 class Verifier(VerifierBase):
-    def __init__(self, lookahead: int, device: torch.device, target_model_runner: ModelRunner, tokenizer: AutoTokenizer = None):
+    def __init__(
+        self,
+        lookahead: int,
+        device: torch.device,
+        target_model_runner: ModelRunner,
+        sampler_x: float | None = None,
+        async_fan_out: int | None = None,
+        jit_speculate: bool = False,
+        tokenizer: AutoTokenizer = None,
+        metrics: dict = None,
+    ):
         super().__init__(lookahead, device)
         self.target_model_runner = target_model_runner
+        self.sampler_x = sampler_x
+        self.async_fan_out = async_fan_out
+        self.jit_speculate = jit_speculate
         self.tokenizer = tokenizer
+        self.metrics = metrics
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
         # TODO: Eagle
@@ -31,42 +45,45 @@ class Verifier(VerifierBase):
                 offset += seq_len
 
         return VerifyResult(
-            seqs,
             [], # no accepted tokens for prefill, just recovery tokens (first sampled token).
             [seq.recovery_token_id for seq in seqs],
             eagle_acts if eagle else None,
         )
 
-    def verify(self, speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
+    def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         """Verify speculative tokens using the target model."""
-        seqs_copy = speculate_result.seqs_copy
-        batch_size = len(seqs_copy)
+        batch_size = len(seqs)
 
-        result = self.target_model_runner.call("run", seqs_copy, False, False, True)
+        result = self.target_model_runner.call("run", seqs, False, False, True)
         
         if eagle:
             logits_p_flat, eagle_acts_flat = result
         else:
             logits_p_flat = result
 
-        for s in seqs_copy:  # was debuge, but is correct 
+        for s in seqs:
             s.num_cached_tokens += self.lookahead + 1
 
         logits_p = logits_p_flat.view(
             batch_size, self.lookahead + 1, -1)  # [b, k+1, v]
 
         # Build per-seq temps for target verify and draft q respectively.
-        temps_target = temps_draft = [seq.temperature for seq in seqs_copy]
+        temps_target = temps_draft = [seq.temperature for seq in seqs]
         temperatures_target = torch.tensor(temps_target, dtype=torch.float32, device=self.device)
         temperatures_draft = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)
 
         new_suffixes, recovery_tokens = verify(
-            logits_p,
-            speculate_result.logits_q,
-            speculate_result.speculations,
-            temperatures_target,
-            temperatures_draft,
+            logits_p=logits_p,
+            logits_q=speculate_result.logits_q,
+            speculations=speculate_result.speculations,
+            temperatures_target=temperatures_target,
+            temperatures_draft=temperatures_draft,
+            cache_hits=speculate_result.cache_hits,
+            sampler_x=self.sampler_x,
+            async_fan_out=self.async_fan_out,
+            jit_speculate=self.jit_speculate,
         )
+
 
         # # Debug: print recovery tokens detokenized
         if __debug__ and recovery_tokens is not None and len(recovery_tokens) > 0:
@@ -79,29 +96,27 @@ class Verifier(VerifierBase):
                     recovery_texts.append(f"<token_id:{token}>")
             print(f"[BANANA][verify] recovery tokens: {recovery_texts}", flush=True)
 
-        # METRICS["accepted_suffix_lens_with_recovery"].extend(
-        #     [len(s) for s in new_suffixes]) 
+        self.metrics["accepted_suffix_lens_with_recovery"].extend(
+            [len(s) for s in new_suffixes])
 
         # For async mode, also track accepted suffix lengths only for cache hits
-        # if self.config.draft_async and cache_hits is not None:
-        #     for i, suffix_len in enumerate([len(s) for s in new_suffixes]):
-        #         if cache_hits[i] == 1:  # Cache hit
-        #             METRICS["accepted_suffix_lens_on_hit"].append(suffix_len)
-        #         else: # cache miss
-        #             METRICS["accepted_suffix_lens_on_miss"].append(suffix_len)
+        if speculate_result.cache_hits is not None:
+            for i, suffix_len in enumerate([len(s) for s in new_suffixes]):
+                if speculate_result.cache_hits[i] == 1:  # Cache hit
+                    self.metrics["accepted_suffix_lens_on_hit"].append(suffix_len)
+                else:  # cache miss
+                    self.metrics["accepted_suffix_lens_on_miss"].append(suffix_len)
 
         # Print mean length of new suffixes for monitoring
-        if new_suffixes:
-            mean_suffix_len = sum(len(suffix)
-                                  for suffix in new_suffixes) / len(new_suffixes)
-            if __debug__: print(f"[BANANA][verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
+        if __debug__ and new_suffixes:
+            mean_suffix_len = sum([len(suffix) for suffix in new_suffixes]) / len(new_suffixes)
+            print(f"[verify] mean new suffix length: {mean_suffix_len:.2f}", flush=True)
 
         eagle_acts = None
         if eagle:
             eagle_acts = eagle_acts_flat.view(batch_size, self.lookahead + 1, -1)
         
         return VerifyResult(
-            seqs_copy=seqs_copy,
             new_suffixes=new_suffixes,
             recovery_tokens=recovery_tokens,
             eagle_acts=eagle_acts,
