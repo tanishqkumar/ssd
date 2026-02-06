@@ -172,6 +172,7 @@ def create_llm_kwargs(args, draft_path):
         max_model_len=args.max_model_len,
         sampler_x=args.x,
         jit_speculate=args.jit,
+        max_steps=args.max_steps,
     )
 
     # Pass fan out list if specified
