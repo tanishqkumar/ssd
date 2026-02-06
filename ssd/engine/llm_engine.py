@@ -318,6 +318,7 @@ class LLMEngine:
                     f" of {max_steps}" if max_steps != float('inf') else "",
                     flush=True,
                 )
+            i += 1
             t = perf_counter()
             output = self.step(inference_step)
             time_taken = perf_counter() - t
