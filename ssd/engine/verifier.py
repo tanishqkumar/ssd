@@ -94,7 +94,7 @@ class Verifier(VerifierBase):
                     recovery_texts.append(text)
                 except Exception:
                     recovery_texts.append(f"<token_id:{token}>")
-            print(f"[BANANA][verify] recovery tokens: {recovery_texts}", flush=True)
+            print(f"[verify] recovery tokens: {recovery_texts}", flush=True)
 
         self.metrics["accepted_suffix_lens_with_recovery"].extend(
             [len(s) for s in new_suffixes])
