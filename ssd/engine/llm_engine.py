@@ -273,7 +273,11 @@ class LLMEngine:
                 lookahead=config.speculate_k,
                 device=config.device,
                 target_model_runner=self.model_runner,
+                sampler_x=config.sampler_x,
+                async_fan_out=config.async_fan_out,
+                jit_speculate=config.jit_speculate,
                 tokenizer=self.tokenizer,
+                metrics=METRICS,
             )
             return SpecDecodeStep(
                 scheduler=self.scheduler,

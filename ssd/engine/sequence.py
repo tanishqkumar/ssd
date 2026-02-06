@@ -16,10 +16,10 @@ class Sequence:
     # Sequence.block_size set first thing in ModelRunner init
 
     _ATTRIBUTES = [
-        'seq_id', 'status', 'token_ids', 'last_token', 'num_tokens', 
-        'num_prompt_tokens', 'num_cached_tokens', 'block_table', 
-        'last_spec_step_accepted_len', 'draft_block_table', 
-        'num_draft_cached_tokens', 'temperature', 'max_new_tokens', 
+        'seq_id', 'status', 'token_ids', 'last_token', 'num_tokens',
+        'num_prompt_tokens', 'num_cached_tokens', 'block_table',
+        'last_spec_step_accepted_len', 'draft_block_table',
+        'num_draft_cached_tokens', 'temperature', 'draft_temperature', 'max_new_tokens',
         'ignore_eos', 'recovery_token_id', 'last_target_hidden_state'
     ]
 
@@ -38,6 +38,7 @@ class Sequence:
         self.num_draft_cached_tokens = 0
 
         self.temperature = sampling_params.temperature
+        self.draft_temperature = sampling_params.draft_temperature
         self.max_new_tokens = sampling_params.max_new_tokens
         self.ignore_eos = sampling_params.ignore_eos
 

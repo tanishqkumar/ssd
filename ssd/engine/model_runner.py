@@ -545,7 +545,10 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
         for seq in seqs:
-            temperatures.append(seq.temperature)
+            if self.is_draft and seq.draft_temperature is not None:
+                temperatures.append(seq.draft_temperature)
+            else:
+                temperatures.append(seq.temperature)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
