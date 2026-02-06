@@ -17,18 +17,19 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    device: torch.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # spec config args
     draft_hf_config: AutoConfig | None = None
     speculate: bool = False 
     draft: str = "/data/shared/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
     speculate_k: int = 1
-    draft_async: bool = False 
-    async_fan_out: int = 3
+    draft_async: bool = False
     
     # async spec only
     draft_async_temp: float | None = None
     target_async_temp: float | None = None
+    async_fan_out: int = 3
     fan_out_list: list[int] | None = None
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
@@ -40,10 +41,10 @@ class Config:
     d_model_target: int | None = None
     tokenizer_path: str | None = None
 
-    
-    device: torch.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    # Debugging
     verbose: bool = False 
     debug_mode: bool = False 
+    max_steps: int | None = None
 
     @property
     def max_blocks(self): 

@@ -1,10 +1,13 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import torch
+from transformers import AutoTokenizer
+
 from ssd.engine.model_runner import ModelRunner
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
+from ssd.utils.misc import decode_tokens
 
 
 class InferenceStep(ABC):
@@ -23,12 +26,21 @@ class InferenceStep(ABC):
 
 class AutoRegressiveStep(InferenceStep):
 
-    def __init__(self, scheduler: Scheduler, model_runner: ModelRunner):
+    def __init__(self, scheduler: Scheduler, model_runner: ModelRunner, tokenizer: AutoTokenizer):
         super().__init__(scheduler)
         self.model_runner = model_runner
+        self.tokenizer = tokenizer
 
     def step(self, seqs: list[Sequence], is_prefill: bool) -> int:
+        if __debug__:
+            print(f'[auto_regressive_step] is_prefill={is_prefill}', flush=True)
+
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+
+        if __debug__:
+            decoded_tokens = decode_tokens(token_ids, self.tokenizer)
+            print(f"[auto_regressive_step] generated tokens: {decoded_tokens}", flush=True)
+
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         return len(seqs) if not is_prefill else sum(len(seq) for seq in seqs)
 
@@ -41,32 +53,54 @@ class AutoRegressiveStep(InferenceStep):
 
 class SpecDecodeStep(InferenceStep):
 
-    def __init__(self, scheduler: Scheduler, speculator: SpeculatorBase, verifier: VerifierBase, eagle: bool):
+    def __init__(self, scheduler: Scheduler, speculator: SpeculatorBase, verifier: VerifierBase, eagle: bool, tokenizer: AutoTokenizer):
         super().__init__(scheduler)
         self.speculator = speculator
         self.verifier = verifier
         self.eagle = eagle
+        self.tokenizer = tokenizer
 
     def prefill(self, seqs: list[Sequence]) -> int:
         verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
-        speculate_result = self.speculator.prefill(verify_result, eagle=self.eagle)
-        return sum(len(seq) for seq in speculate_result.seqs_copy)
+        speculate_result = self.speculator.prefill(seqs, verify_result)
+        return sum(len(seq) for seq in seqs)
 
     def decode(self, seqs: list[Sequence]) -> int:
+        # It's important to not modify the original Sequence list in place, since it's used by the scheduler.
+        # The original Sequence list is updated in self.scheduler.postprocess_speculate to reflect the
+        # new suffixes and recovery tokens after speculation and verification.
+        seqs_orig = seqs
+        seqs_copy = [seq.clone_spec() for seq in seqs_orig]
         in_verify_result = VerifyResult(
-            seqs_copy=seqs,
             new_suffixes=[],
             recovery_tokens=[],
             eagle_acts=None,
         )
-        speculate_result = self.speculator.speculate(in_verify_result, eagle=self.eagle)
-        out_verify_result = self.verifier.verify(speculate_result, eagle=self.eagle)
-        # handles BOTH block managers and seq state
+        speculate_result = self.speculator.speculate(seqs_copy, in_verify_result)
 
-        # TODO: Think about this abstraction
+        if __debug__:
+            speculations = speculate_result.speculations
+            print(f"[SpecDecodeStep] speculations: {speculations}", flush=True)
+            speculations_list = speculations.tolist()
+
+            for i, speculation in enumerate(speculations_list):
+                decoded_tokens = decode_tokens(speculation, self.tokenizer)
+                print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
+
+        out_verify_result = self.verifier.verify(seqs_copy, speculate_result, eagle=self.eagle)
+
+        if __debug__:
+            recovery_tokens = out_verify_result.recovery_tokens
+            new_suffixes = out_verify_result.new_suffixes
+            for i, new_suffix in enumerate(new_suffixes):
+                decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
+                print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
+
+        # handles BOTH block managers and seq state
         self.scheduler.postprocess_speculate(
-            out_verify_result.seqs_copy,
+            seqs_orig,
             out_verify_result.new_suffixes,
             out_verify_result.recovery_tokens,
         )
+
         return sum(len(s) for s in out_verify_result.new_suffixes)

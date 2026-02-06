@@ -31,11 +31,10 @@ class SpeculatorAsync(SpeculatorBase):
         self.async_pg = async_pg
         self.draft_runner_rank = draft_runner_rank
 
-    def prefill(self, verify_result: VerifyResult, eagle: bool = False) -> SpeculateResult:
-        skip_first = 1 if eagle else 0
-        seqs = verify_result.seqs_copy
+    def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
-        
+        skip_first = 1 if eagle_acts else 0
+
         # 1) build all the prefill payload in one shot
         input_ids, positions, cu_q, cu_k, max_q, max_k, slot_map = \
             prepare_prefill_tensors_from_seqs(
@@ -84,8 +83,7 @@ class SpeculatorAsync(SpeculatorBase):
             dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
         
         # 6) send eagle_acts if use_eagle
-        if eagle:
-            assert eagle_acts is not None, "eagle_acts must be provided when use_eagle is True"
+        if eagle_acts:
             dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
 
         for seq in seqs:
@@ -93,9 +91,9 @@ class SpeculatorAsync(SpeculatorBase):
             seq.num_cached_tokens = seq.num_prompt_tokens
             seq.num_draft_cached_tokens = seq.num_prompt_tokens
 
-        return SpeculateResult(seqs, [], [])
+        return SpeculateResult([], [])
 
-    def speculate(self, verify_result: VerifyResult, eagle: bool = False) -> SpeculateResult:
+    def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         """
         - Hit the cache with cache_keys, get speculations and logits
             - This will involve deallocating past failed fork blocks, and allocating new forks, and coordinating this with the draft runner
@@ -104,11 +102,8 @@ class SpeculatorAsync(SpeculatorBase):
             - This includes using helpers that eg. allocate blocks for the forked sequences 
             - And sending context we built to DraftRunner via nccl 
         """
-        seqs = verify_result.seqs_copy
-        seqs_copy = [seq.clone_spec() for seq in seqs]
-
-        # Append recovery tokens to local seqs_copy to correctly calculate initial positions
-        for seq in seqs_copy:
+        # Append recovery tokens to local seqs to correctly calculate initial positions
+        for seq in seqs:
             if seq.recovery_token_id is None:
                 raise ValueError(
                     f"recovery_token_id is None for seq {seq.seq_id}")
@@ -129,7 +124,8 @@ class SpeculatorAsync(SpeculatorBase):
         #     print(f"{'='*80}\n", flush=True)
 
         # hit draft tree cache via handshake API, this bounds them
-        speculations_tokens, logits_q = self.target_draft_handshake(seqs_copy, eagle)
+        eagle = verify_result.eagle_acts is not None
+        speculations_tokens, logits_q, cache_hits = self.target_draft_handshake(seqs, eagle)
 
         # The first column of the final speculation tensor is the recovery tokens
         recovery_tokens_tensor = torch.tensor(
@@ -141,8 +137,8 @@ class SpeculatorAsync(SpeculatorBase):
         speculations = torch.cat(
             [recovery_tokens_tensor.unsqueeze(1), speculations_tokens], dim=1)
 
-        # Update seqs_copy with all speculated tokens for the verify step to pass through the target model
-        for i, seq in enumerate(seqs_copy):
+        # Update seqs with all speculated tokens for the verify step to pass through the target model
+        for i, seq in enumerate(seqs):
             # we added rec token first thing
             seq.token_ids.extend(speculations_tokens[i].tolist())
             seq.num_tokens = len(seq.token_ids)
@@ -154,27 +150,15 @@ class SpeculatorAsync(SpeculatorBase):
             seq.num_draft_cached_tokens += len(speculations_tokens[i]) + 1
 
         # speculations is [B, K+1] at this point since we prepending seq.recovery_token_id for
-        return SpeculateResult(seqs_copy, speculations, logits_q)
+        return SpeculateResult(speculations, logits_q, cache_hits)
 
 
-    def target_draft_handshake(self, seqs_copy: list[Sequence], eagle: bool):
+    def target_draft_handshake(self, seqs: list[Sequence], eagle: bool):
         """Send a spec request command with cache keys to get speculations/logits."""
-
-
-        # seqs: list[Sequence],
-        # lookahead: int,
-        # async_fan_out: int,
-        # max_blocks: int,
-        # eagle: bool,
-        # vocab_size: int,
-        # draft_dtype: torch.dtype,
-        # device: torch.device,
-        # async_pg: dist.ProcessGroup,
-        # draft_runner_rank: int,
 
         # Use the handshake helper to handle the complete protocol
         handshake = TargetDraftHandshake(
-            seqs=seqs_copy,
+            seqs=seqs,
             lookahead=self.lookahead,
             async_fan_out=self.async_fan_out,
             max_blocks=self.max_blocks,
@@ -185,6 +169,6 @@ class SpeculatorAsync(SpeculatorBase):
             async_pg=self.async_pg,
             draft_runner_rank=self.draft_runner_rank
         )
-        speculations, logits_q = handshake.execute_full_handshake()
+        speculations, logits_q, cache_hits = handshake.execute_full_handshake()
 
-        return speculations, logits_q
+        return speculations, logits_q, cache_hits

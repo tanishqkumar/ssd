@@ -1,4 +1,6 @@
 import torch
+
+from ssd.engine.sequence import Sequence
 from ssd.engine.model_runner import ModelRunner
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, SpeculatorBase
 
@@ -9,10 +11,9 @@ class SpeculatorSync(SpeculatorBase):
         super().__init__(lookahead, device)
         self.draft_model_runner = draft_model_runner
 
-    def prefill(self, verify_result: VerifyResult, eagle: bool = False) -> SpeculateResult:
-        assert not eagle, "Eagle is not currently supported for synchronous speculation"
+    def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
+        assert not verify_result.eagle_acts, "Eagle is not currently supported for synchronous speculation"
         print('[spec_prefill] target prefill', flush=True)
-        seqs = verify_result.seqs_copy
         self.draft_model_runner.call("run", seqs, True)
         # recovery token will be first token in next fwd, but not yet in kvc of either model
         for seq in seqs:
@@ -24,16 +25,15 @@ class SpeculatorSync(SpeculatorBase):
             print(
                 f"[PREFILL] seq0 prompt_len={seqs[0].num_prompt_tokens} recovery={seqs[0].recovery_token_id}", flush=True)
 
-        return SpeculateResult(verify_result.seqs_copy, [], [])
+        return SpeculateResult([], [])
 
-    def speculate(self, verify_result: VerifyResult, eagle: bool = False) -> SpeculateResult:
+    def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         """Generate k speculative tokens using the draft model."""
-        assert not eagle, "Eagle is not currently supported for synchronous speculation"
+        assert not verify_result.eagle_acts, "Eagle is not currently supported for synchronous speculation"
 
         # TODO: How do we get the target activations from the last verify?
-        seqs_copy = [seq.clone_spec() for seq in verify_result.seqs_copy]
 
-        batch_size = len(seqs_copy)
+        batch_size = len(seqs)
 
         speculations = torch.zeros(
             batch_size, self.lookahead + 1,
@@ -44,7 +44,7 @@ class SpeculatorSync(SpeculatorBase):
 
         # Single batched write to GPU
         recovery_tokens = []
-        for i, seq in enumerate(seqs_copy):
+        for i, seq in enumerate(seqs):
             if seq.recovery_token_id is None:
                 raise ValueError(f"recovery_token_id is None for seq {i}")
             recovery_tokens.append(seq.recovery_token_id)
@@ -55,9 +55,9 @@ class SpeculatorSync(SpeculatorBase):
         for k in range(self.lookahead + 1):
             # Draft model forward pass - emits [B] tokens, True is for draft_return_logits
             token_ids, step_logits_q = self.draft_model_runner.call(
-                "run", seqs_copy, False, True, True)
+                "run", seqs, False, True, True)
             # make sure we include this even on last iter since we put K+1 tokens thru draft cache
-            for s in seqs_copy:
+            for s in seqs:
                 s.num_draft_cached_tokens += 1
 
             if k == self.lookahead:
@@ -65,7 +65,7 @@ class SpeculatorSync(SpeculatorBase):
 
             logits_q.append(step_logits_q)
 
-            for i, (seq, token_id) in enumerate(zip(seqs_copy, token_ids)):
+            for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
                 seq.append_token(token_id)
 
             # Single batched write to GPU
@@ -74,4 +74,4 @@ class SpeculatorSync(SpeculatorBase):
 
         logits_q = torch.stack(logits_q, dim=1)  # [B, K, V]
 
-        return SpeculateResult(seqs_copy, speculations, logits_q)
+        return SpeculateResult(speculations, logits_q)
