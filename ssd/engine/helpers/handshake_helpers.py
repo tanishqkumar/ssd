@@ -55,10 +55,10 @@ class TargetDraftHandshake:
         # Prepare num_tokens - shape contract: [B]
         self.num_tokens = torch.tensor(
             [seq.num_tokens for seq in self.seqs], dtype=torch.int64, device=self.device)  # [B]
-        
+
         # Draft-side temperatures for tree decode: prefer per-seq override, else global config override, else seq.temperature
         self.temperatures = torch.tensor(
-            [seq.temperature for seq in self.seqs],
+            [seq.draft_temperature or seq.temperature for seq in self.seqs],
             dtype=torch.float32,
             device=self.device,
         )  # [B]

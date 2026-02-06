@@ -5,7 +5,6 @@ import torch
 
 @dataclass
 class Config:
-                
     model: str = "/data/shared/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 1 
@@ -27,8 +26,6 @@ class Config:
     draft_async: bool = False
     
     # async spec only
-    draft_async_temp: float | None = None
-    target_async_temp: float | None = None
     async_fan_out: int = 3
     fan_out_list: list[int] | None = None
     fan_out_list_miss: list[int] | None = None
