@@ -101,6 +101,8 @@ class Verifier(VerifierBase):
 
         # For async mode, also track accepted suffix lengths only for cache hits
         if speculate_result.cache_hits is not None:
+            self.metrics["cache_hits"].append(
+                speculate_result.cache_hits.to(torch.float32).mean().item())
             for i, suffix_len in enumerate([len(s) for s in new_suffixes]):
                 if speculate_result.cache_hits[i] == 1:  # Cache hit
                     self.metrics["accepted_suffix_lens_on_hit"].append(suffix_len)
