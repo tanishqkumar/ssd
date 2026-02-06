@@ -6,14 +6,13 @@ from abc import ABC, abstractmethod
 
 @dataclass
 class SpeculateResult:
-    seqs_copy: list[Sequence]
     speculations: torch.Tensor
     logits_q: torch.Tensor
+    cache_hits: torch.Tensor | None = None
 
 
 @dataclass
 class VerifyResult:
-    seqs_copy: list[Sequence]
     new_suffixes: list[list[int]]
     recovery_tokens: list[int]
     eagle_acts: torch.Tensor | None = None  # Is this a tensor?
@@ -25,11 +24,11 @@ class SpeculatorBase(ABC):
         self.device = device
 
     @abstractmethod
-    def prefill(self, verify_result: VerifyResult, eagle: bool = False) -> SpeculateResult:
+    def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         pass
 
     @abstractmethod
-    def speculate(self, verify_result: VerifyResult, eagle: bool = False) -> SpeculateResult:
+    def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         pass
 
 
@@ -43,5 +42,5 @@ class VerifierBase(ABC):
         pass
 
     @abstractmethod
-    def verify(self, speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
+    def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         pass

@@ -32,6 +32,7 @@ METRICS = {
     "prefill_total_tokens": 0,
     "decode_total_tokens": 0,
     "target_step_times": [],
+    "num_spec_steps": [],
 }
 
 
@@ -202,15 +203,15 @@ class LLMEngine:
         print(
             f"Final Decode Throughput: {int(avg_decode_throughput)}tok/s", flush=True)
 
-
         if self.config.speculate:
+            ttl_accepted_with_recovery = sum(METRICS['accepted_suffix_lens_with_recovery'])
+            ttl_num_spec_steps = len(METRICS['accepted_suffix_lens_with_recovery'])
+            avg_tokens_per_step = ttl_accepted_with_recovery / ttl_num_spec_steps
             print(
-                f"[metrics] Avg Tokens per step (incl recovery): {sum(METRICS['accepted_suffix_lens_with_recovery']) / len(METRICS['accepted_suffix_lens_with_recovery']):.2f}", flush=True)
-            num_new_spec_accepts = sum(METRICS['accepted_suffix_lens_with_recovery']) - len(
-                METRICS['accepted_suffix_lens_with_recovery'])
-            num_spec_steps = len(METRICS['accepted_suffix_lens_with_recovery'])
-            avg_acceptance_rate = (
-                num_new_spec_accepts / num_spec_steps)/self.config.speculate_k
+                f"[metrics] Avg Tokens per step (incl recovery): {avg_tokens_per_step:.2f}", flush=True)
+
+            total_accepted = ttl_accepted_with_recovery - ttl_num_spec_steps
+            avg_acceptance_rate = (total_accepted / ttl_num_spec_steps) / self.config.speculate_k
             print(
                 f"[metrics] Avg Fraction of Speculated Tokens Accepted: {avg_acceptance_rate:.2f}", flush=True)
             print(
@@ -279,11 +280,13 @@ class LLMEngine:
                 speculator=speculator,
                 verifier=verifier,
                 eagle=config.use_eagle,
+                tokenizer=self.tokenizer,
             )
         else:
             return AutoRegressiveStep(
                 scheduler=self.scheduler,
                 model_runner=self.model_runner,
+                tokenizer=self.tokenizer,
             )
 
     def generate(
@@ -303,7 +306,14 @@ class LLMEngine:
 
         outputs = {}
         inference_step = self.create_inference_step(self.config)
-        while not self.is_finished():
+        i = 0
+        max_steps = self.config.max_steps if self.config.max_steps is not None else float('inf')
+        while not self.is_finished() and i < max_steps:
+            if self.config.verbose:
+                print(f"[generate] step {i+1}" +
+                    f" of {max_steps}" if max_steps != float('inf') else "",
+                    flush=True,
+                )
             t = perf_counter()
             output = self.step(inference_step)
             time_taken = perf_counter() - t
