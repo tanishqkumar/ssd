@@ -1,8 +1,9 @@
+import os
 import torch
 from typing import List
 from ssd.utils.context import set_context, get_context, reset_context
 from ssd.engine.helpers.mask_helpers import get_custom_mask
-from flashinfer.quantization import segment_packbits 
+from flashinfer.quantization import segment_packbits
 from time import perf_counter
 
 ## RUN CUDAGRAPHS
@@ -79,7 +80,7 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
 
 cache = {}
 
-PROFILE = False
+PROFILE = os.environ.get("SSD_PROFILE", "0") == "1"
 
 @torch.inference_mode()
 def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits):
