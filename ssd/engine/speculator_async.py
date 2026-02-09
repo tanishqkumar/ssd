@@ -1,9 +1,12 @@
 import torch
 import torch.distributed as dist
+from transformers import AutoTokenizer
+
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, SpeculatorBase
 from ssd.engine.helpers.runner_helpers import prepare_prefill_tensors_from_seqs
 from ssd.engine.helpers.handshake_helpers import TargetDraftHandshake
 from ssd.engine.sequence import Sequence
+from ssd.utils.misc import decode_tokens
 
 
 class SpeculatorAsync(SpeculatorBase):
@@ -20,6 +23,8 @@ class SpeculatorAsync(SpeculatorBase):
         max_model_len: int,
         async_pg: dist.ProcessGroup,
         draft_runner_rank: int,
+        tokenizer: AutoTokenizer,
+        verbose: bool,
     ):
         super().__init__(lookahead, device)
         self.async_fan_out = async_fan_out
@@ -30,6 +35,8 @@ class SpeculatorAsync(SpeculatorBase):
         self.max_model_len = max_model_len
         self.async_pg = async_pg
         self.draft_runner_rank = draft_runner_rank
+        self.tokenizer = tokenizer
+        self.verbose = verbose
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
@@ -108,20 +115,21 @@ class SpeculatorAsync(SpeculatorBase):
                 raise ValueError(
                     f"recovery_token_id is None for seq {seq.seq_id}")
             seq.append_token(seq.recovery_token_id)
-        
+
         # Log sequence trunk state for debugging
-        # if self.config.verbose:
-        #     print(f"\n{'='*80}", flush=True)
-        #     print(f"[TARGET SEQUENCE TRUNK] Batch size: {len(seqs)}", flush=True)
-        #     for i, seq in enumerate(seqs):
-        #         # Show last 20 tokens of trunk + recovery token
-        #         trunk_tokens = seq.token_ids[-20:] if len(seq.token_ids) > 20 else seq.token_ids
-        #         trunk_text = self.tokenizer.decode(trunk_tokens, skip_special_tokens=False)
-        #         recovery_text = self.tokenizer.decode([seq.recovery_token_id], skip_special_tokens=False)
-        #         print(f"  Seq {seq.seq_id} (len={len(seq.token_ids)}):", flush=True)
-        #         print(f"    Trunk (last 20): ...{trunk_text}", flush=True)
-        #         print(f"    Recovery token: {seq.recovery_token_id} ('{recovery_text}')", flush=True)
-        #     print(f"{'='*80}\n", flush=True)
+        if self.verbose:
+            print(f"\n{'='*80}", flush=True)
+            print(f"[TARGET SEQUENCE TRUNK] Batch size: {len(seqs)}", flush=True)
+            for i, seq in enumerate(seqs):
+                # Show last 20 tokens of trunk + recovery token
+                trunk_tokens = seq.token_ids[-20:] if len(seq.token_ids) > 20 else seq.token_ids
+                trunk_text = decode_tokens(trunk_tokens, self.tokenizer)
+                recovery_text = decode_tokens([seq.recovery_token_id], self.tokenizer)
+                print(f"  Seq {seq.seq_id} (len={len(seq.token_ids)}):", flush=True)
+                print(f"    Trunk (last 20): ...{trunk_text}", flush=True)
+                print(f"    Recovery token: {seq.recovery_token_id} ('{recovery_text}')", flush=True)
+            print(f"{'='*80}\n", flush=True)
+
 
         # hit draft tree cache via handshake API, this bounds them
         eagle = verify_result.eagle_acts is not None

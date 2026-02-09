@@ -31,10 +31,7 @@ class SpeculatorSync(SpeculatorBase):
         """Generate k speculative tokens using the draft model."""
         assert not verify_result.eagle_acts, "Eagle is not currently supported for synchronous speculation"
 
-        # TODO: How do we get the target activations from the last verify?
-
         batch_size = len(seqs)
-
         speculations = torch.zeros(
             batch_size, self.lookahead + 1,
             dtype=torch.int64,
