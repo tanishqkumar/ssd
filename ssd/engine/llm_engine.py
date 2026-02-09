@@ -34,6 +34,7 @@ METRICS = {
     "prefill_total_tokens": 0,
     "decode_total_tokens": 0,
     "target_step_times": [],
+    "target_verify_times": [],
 }
 
 
@@ -573,6 +574,7 @@ class LLMEngine:
             torch.cuda.synchronize()
             _t1 = perf_counter()
 
+        _tv0 = perf_counter()
         verify_result = self.verify(
             seqs_copy, speculations, logits_q, cache_hits=cache_hits)
 
@@ -591,6 +593,7 @@ class LLMEngine:
             new_suffixes, recovery_tokens = verify_result
 
         self.postprocess_speculate(seqs, new_suffixes, recovery_tokens)
+        METRICS["target_verify_times"].append(perf_counter() - _tv0)
 
         if _prof:
             torch.cuda.synchronize()
@@ -652,6 +655,9 @@ class LLMEngine:
                 f"[metrics] Avg Fraction of Speculated Tokens Accepted: {avg_acceptance_rate:.2f}", flush=True)
             print(
                 f"[metrics] Avg target time per full step (ms): {sum(METRICS['target_step_times']) * 1000 / len(METRICS['target_step_times']):.2f}", flush=True)
+            if METRICS['target_verify_times']:
+                print(
+                    f"[metrics] Avg target verify time (ms): {sum(METRICS['target_verify_times']) * 1000 / len(METRICS['target_verify_times']):.2f}", flush=True)
             if self.config.draft_async:
                 print(
                     f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
