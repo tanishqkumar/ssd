@@ -15,11 +15,6 @@ class SpeculatorSync(SpeculatorBase):
         assert not verify_result.eagle_acts, "Eagle is not currently supported for synchronous speculation"
         print('[spec_prefill] target prefill', flush=True)
         self.draft_model_runner.call("run", seqs, True)
-        # recovery token will be first token in next fwd, but not yet in kvc of either model
-        for seq in seqs:
-            assert seq.recovery_token_id is not None
-            seq.num_cached_tokens = seq.num_prompt_tokens
-            seq.num_draft_cached_tokens = seq.num_prompt_tokens
 
         if len(seqs) > 0:
             print(

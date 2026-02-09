@@ -93,11 +93,6 @@ class SpeculatorAsync(SpeculatorBase):
         if eagle_acts:
             dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
 
-        for seq in seqs:
-            assert seq.recovery_token_id is not None
-            seq.num_cached_tokens = seq.num_prompt_tokens
-            seq.num_draft_cached_tokens = seq.num_prompt_tokens
-
         return SpeculateResult([], [])
 
     def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
