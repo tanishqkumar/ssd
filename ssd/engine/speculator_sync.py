@@ -47,7 +47,7 @@ class SpeculatorSync(SpeculatorBase):
             recovery_tokens.append(seq.recovery_token_id)
             seq.append_token(seq.recovery_token_id)
         speculations[:, 0] = torch.tensor(
-            recovery_tokens, dtype=torch.int64, device="cuda")
+            recovery_tokens, dtype=torch.int64, device=self.device)
 
         for k in range(self.lookahead + 1):
             # Draft model forward pass - emits [B] tokens, True is for draft_return_logits
@@ -67,7 +67,7 @@ class SpeculatorSync(SpeculatorBase):
 
             # Single batched write to GPU
             speculations[:, k + 1] = torch.tensor(
-                token_ids, dtype=torch.int64, device="cuda")
+                token_ids, dtype=torch.int64, device=self.device)
 
         logits_q = torch.stack(logits_q, dim=1)  # [B, K, V]
 
