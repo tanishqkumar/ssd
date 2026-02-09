@@ -288,6 +288,7 @@ class LLMEngine:
                 verifier=verifier,
                 eagle=config.use_eagle,
                 tokenizer=self.tokenizer,
+                async_spec=config.draft_async,
             )
         else:
             return AutoRegressiveStep(
