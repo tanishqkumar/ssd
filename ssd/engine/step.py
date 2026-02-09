@@ -55,18 +55,25 @@ class AutoRegressiveStep(InferenceStep):
 
 class SpecDecodeStep(InferenceStep):
 
-    def __init__(self, scheduler: Scheduler, speculator: SpeculatorBase, verifier: VerifierBase, eagle: bool, tokenizer: AutoTokenizer):
+    def __init__(
+        self,
+        scheduler: Scheduler,
+        speculator: SpeculatorBase,
+        verifier: VerifierBase,
+        eagle: bool,
+        tokenizer: AutoTokenizer,
+        async_spec: bool,
+    ):
         super().__init__(scheduler)
         self.speculator = speculator
         self.verifier = verifier
         self.eagle = eagle
         self.tokenizer = tokenizer
-        # Determine if we're using async speculation by checking for async_pg attribute
-        self.is_async = hasattr(speculator, 'async_pg')
+        self.async_spec = async_spec
 
     def prefill(self, seqs: list[Sequence]) -> int:
         # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
-        if not self.eagle and self.is_async:
+        if not self.eagle and self.async_spec:
             empty_verify_result = VerifyResult([], [], None)
             self.speculator.prefill(seqs, empty_verify_result)
             verify_result = self.verifier.prefill(seqs, eagle=False)
