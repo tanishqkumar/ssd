@@ -264,6 +264,8 @@ class LLMEngine:
                     max_model_len=config.max_model_len,
                     async_pg=self.model_runner.async_pg,
                     draft_runner_rank=self.num_tp_gpus,
+                    tokenizer=self.tokenizer,
+                    verbose=config.verbose,
                 )
             else:
                 speculator = SpeculatorSync(
