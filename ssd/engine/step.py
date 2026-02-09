@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
 import torch
+from time import perf_counter
 from transformers import AutoTokenizer
 
 from ssd.engine.model_runner import ModelRunner
@@ -59,16 +61,30 @@ class SpecDecodeStep(InferenceStep):
         self.verifier = verifier
         self.eagle = eagle
         self.tokenizer = tokenizer
+        # Determine if we're using async speculation by checking for async_pg attribute
+        self.is_async = hasattr(speculator, 'async_pg')
 
     def prefill(self, seqs: list[Sequence]) -> int:
-        verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
-        speculate_result = self.speculator.prefill(seqs, verify_result)
+        # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
+        if not self.eagle and self.is_async:
+            empty_verify_result = VerifyResult([], [], None)
+            self.speculator.prefill(seqs, empty_verify_result)
+            verify_result = self.verifier.prefill(seqs, eagle=False)
+        else:
+            verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
+            self.speculator.prefill(seqs, verify_result)
+
         return sum(len(seq) for seq in seqs)
 
     def decode(self, seqs: list[Sequence]) -> int:
         # It's important to not modify the original Sequence list in place, since it's used by the scheduler.
         # The original Sequence list is updated in self.scheduler.postprocess_speculate to reflect the
         # new suffixes and recovery tokens after speculation and verification.
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        if _prof:
+            torch.cuda.synchronize()
+            _t0 = perf_counter()
+
         seqs_orig = seqs
         seqs_copy = [seq.clone_spec() for seq in seqs_orig]
         in_verify_result = VerifyResult(
@@ -77,6 +93,10 @@ class SpecDecodeStep(InferenceStep):
             eagle_acts=None,
         )
         speculate_result = self.speculator.speculate(seqs_copy, in_verify_result)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t1 = perf_counter()
 
         if __debug__:
             speculations = speculate_result.speculations
@@ -88,6 +108,10 @@ class SpecDecodeStep(InferenceStep):
                 print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
 
         out_verify_result = self.verifier.verify(seqs_copy, speculate_result, eagle=self.eagle)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t2 = perf_counter()
 
         if __debug__:
             recovery_tokens = out_verify_result.recovery_tokens
@@ -102,5 +126,13 @@ class SpecDecodeStep(InferenceStep):
             out_verify_result.new_suffixes,
             out_verify_result.recovery_tokens,
         )
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t3 = perf_counter()
+            cache_hits = speculate_result.cache_hits
+            hits_str = f"hits={cache_hits.sum().item()}/{len(cache_hits)}" if cache_hits is not None else ""
+            toks = sum(len(s) for s in out_verify_result.new_suffixes)
+            print(f"[PROFILE target] handshake={(_t1-_t0)*1000:.2f}ms verify={(_t2-_t1)*1000:.2f}ms postprocess={(_t3-_t2)*1000:.2f}ms total={(_t3-_t0)*1000:.2f}ms {hits_str} toks={toks}", flush=True)
 
         return sum(len(s) for s in out_verify_result.new_suffixes)

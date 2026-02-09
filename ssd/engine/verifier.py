@@ -1,4 +1,6 @@
+import os
 import torch
+from time import perf_counter
 from transformers import AutoTokenizer
 
 from ssd.engine.sequence import Sequence
@@ -52,10 +54,20 @@ class Verifier(VerifierBase):
 
     def verify(self, seqs: list[Sequence], speculate_result: SpeculateResult, eagle: bool = False) -> VerifyResult:
         """Verify speculative tokens using the target model."""
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         batch_size = len(seqs)
 
+        if _prof:
+            torch.cuda.synchronize()
+            _vt0 = perf_counter()
+
+        _tv0 = perf_counter()
         result = self.target_model_runner.call("run", seqs, False, False, True)
-        
+
+        if _prof:
+            torch.cuda.synchronize()
+            _vt1 = perf_counter()
+
         if eagle:
             logits_p_flat, eagle_acts_flat = result
         else:
@@ -83,6 +95,13 @@ class Verifier(VerifierBase):
             async_fan_out=self.async_fan_out,
             jit_speculate=self.jit_speculate,
         )
+
+        self.metrics["target_verify_times"].append(perf_counter() - _tv0)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _vt2 = perf_counter()
+            print(f"[PROFILE verify] target_fwd={(_vt1-_vt0)*1000:.2f}ms verify_compute={(_vt2-_vt1)*1000:.2f}ms", flush=True)
 
 
         # # Debug: print recovery tokens detokenized
