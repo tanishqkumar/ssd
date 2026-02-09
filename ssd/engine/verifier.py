@@ -80,7 +80,8 @@ class Verifier(VerifierBase):
             batch_size, self.lookahead + 1, -1)  # [b, k+1, v]
 
         # Build per-seq temps for target verify and draft q respectively.
-        temps_target = temps_draft = [seq.temperature for seq in seqs]
+        temps_target = [seq.temperature for seq in seqs]
+        temps_draft = [seq.draft_temperature or seq.temperature for seq in seqs]
         temperatures_target = torch.tensor(temps_target, dtype=torch.float32, device=self.device)
         temperatures_draft = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)
 
