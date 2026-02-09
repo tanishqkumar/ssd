@@ -81,6 +81,11 @@ class SpecDecodeStep(InferenceStep):
             verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
             self.speculator.prefill(seqs, verify_result)
 
+        for seq in seqs:
+            assert seq.recovery_token_id is not None
+            seq.num_cached_tokens = seq.num_prompt_tokens
+            seq.num_draft_cached_tokens = seq.num_prompt_tokens
+
         return sum(len(seq) for seq in seqs)
 
     def decode(self, seqs: list[Sequence]) -> int:
@@ -99,6 +104,7 @@ class SpecDecodeStep(InferenceStep):
             recovery_tokens=[],
             eagle_acts=None,
         )
+        #### STEP 1: SPECULATE ####
         speculate_result = self.speculator.speculate(seqs_copy, in_verify_result)
 
         if _prof:
@@ -114,6 +120,7 @@ class SpecDecodeStep(InferenceStep):
                 decoded_tokens = decode_tokens(speculation, self.tokenizer)
                 print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
 
+        #### STEP 2: VERIFY ####
         out_verify_result = self.verifier.verify(seqs_copy, speculate_result, eagle=self.eagle)
 
         if _prof:
@@ -127,11 +134,13 @@ class SpecDecodeStep(InferenceStep):
                 decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
                 print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
 
-        # handles BOTH block managers and seq state
+        #### STEP 3: POSTPROCESS ####
+        # The postprocess step handles BOTH block managers and seq state (including EAGLE activations)
         self.scheduler.postprocess_speculate(
             seqs_orig,
             out_verify_result.new_suffixes,
             out_verify_result.recovery_tokens,
+            eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
         )
 
         if _prof:

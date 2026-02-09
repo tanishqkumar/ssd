@@ -279,21 +279,28 @@ class Scheduler:
                     self._finalize_block(self.draft_block_manager, seq, seq.draft_block_table, block_index)
 
     def postprocess_speculate(
-        self, 
-        seqs: list[Sequence], 
-        new_suffixes: list[list[int]], 
-        next_recovery_tokens: list[int]
+        self,
+        seqs: list[Sequence],
+        new_suffixes: list[list[int]],
+        next_recovery_tokens: list[int],
+        eagle_acts: torch.Tensor | None = None
     ):
-        
-        for seq, new_suffix, next_recovery_token in zip(seqs, new_suffixes, next_recovery_tokens):
+
+        for i, (seq, new_suffix, next_recovery_token) in enumerate(zip(seqs, new_suffixes, next_recovery_tokens)):
             # ---- EOS/sequence metadata updates (non kv cache metadata) ----
-            new_suffix, finished = self._handle_eos_and_max_new_tokens(seq, new_suffix)  
+            new_suffix, finished = self._handle_eos_and_max_new_tokens(seq, new_suffix)
 
             # ---- kv cache updates to roll back to accepted idx (fwd makes kv cache for entire speculation) ----
             self._update_kv_caches(seq, new_suffix)
 
             # ---- sequence metadata updates ----
             self._update_sequence_metadata(seq, new_suffix, next_recovery_token)
+
+            # ---- EAGLE activation updates for next speculation ----
+            if eagle_acts is not None:
+                accepted_len = len(new_suffix)
+                idx = min(accepted_len - 1, eagle_acts.shape[1] - 1)
+                seq.last_target_hidden_state = eagle_acts[i, idx]
 
             if finished:
                 if __debug__: print(f'Sequence {seq.seq_id} finished, deallocating and marking as done + removing from running', flush=True)
