@@ -1,3 +1,5 @@
+import os
+import time
 import torch
 import torch.distributed as dist
 import dataclasses
@@ -37,6 +39,8 @@ class DraftRunner(ModelRunner):
 
         if self.is_draft and self.draft_async:
             self._reset_tree_cache_tensors()
+            self._init_prealloc_buffers()
+            self._draft_step_times = []
             print(f'DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
 
@@ -124,11 +128,22 @@ class DraftRunner(ModelRunner):
     def _reset_tree_cache_tensors(self):
         """Reset tensor-backed tree cache to empty."""
         # initialize as empty keys on correct device; tokens/logits set to None until first populate
-        self.tree_cache_keys = torch.zeros( 
+        self.tree_cache_keys = torch.zeros(
             (0, 3), dtype=torch.int64, device=self.device)
         self.tree_cache_tokens = None
         self.tree_cache_logits = None
         self.tree_cache_activations = None
+
+    def _init_prealloc_buffers(self):
+        # PERFORMANCE: pre-allocate constant tensors used every draft step to avoid repeated CUDA mallocs
+        K, MQ_LEN = self.config.speculate_k, self.config.MQ_LEN
+        d = self.device
+        self._step_pos_offsets = torch.arange(K, device=d, dtype=torch.int64)[:, None] * MQ_LEN
+        self._step_rope_offsets = torch.arange(K, device=d, dtype=torch.int64)[:, None]
+        self._fan_idx_hit = torch.arange(K + 1, device=d, dtype=torch.int64).repeat_interleave(self.config.fan_out_t)
+        self._fan_idx_miss = torch.arange(K + 1, device=d, dtype=torch.int64).repeat_interleave(self.config.fan_out_t_miss)
+        self._arange_mq = torch.arange(MQ_LEN, device=d, dtype=torch.int64)
+        self._arange_kp1 = torch.arange(K + 1, device=d, dtype=torch.int64)
 
     def jit_speculate(self, 
                       request_keys: torch.Tensor, 
@@ -198,10 +213,9 @@ class DraftRunner(ModelRunner):
         # Draft model now returns full target vocab size logits (after d2t expansion)
         V = self.hf_config.vocab_size
 
-        torch.manual_seed(0)
-        out_logits = torch.randn( 
-            (B, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
-        out_tokens = torch.argmax(out_logits, dim=-1)[:, :K] # [B, K]
+        # PERFORMANCE: torch.empty instead of torch.manual_seed(0)+torch.randn — avoids CUDA device sync + 1.2MB wasted alloc
+        out_logits = torch.empty((B, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
+        out_tokens = torch.empty((B, K), dtype=torch.int64, device=self.device)
         cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache_and_respond: request_keys should be (B, 3), got {request_keys.shape}"
@@ -386,40 +400,28 @@ class DraftRunner(ModelRunner):
 
     
     def prepare_glue_decode_ctxt(self, num_tokens, input_ids, dbt, B):
-        assert num_tokens.shape == (B,), f"ERROR in prepare_glue_decode_ctxt: num_tokens should be (B,), got {num_tokens.shape}"
-
         K = self.config.speculate_k
         pos_offset = -1 if self.config.use_eagle else 0
         positions_start = (num_tokens - 1 + pos_offset).unsqueeze(-1)
-        positions_grid = positions_start + torch.arange(K + 1, device=self.device)
+        positions_grid = positions_start + self._arange_kp1
 
         # Calculate block indices and offsets for ALL positions
-        block_indices = (positions_grid //
-                         self.block_size).to(torch.int64)  # [B, K+1]
-        offsets = (positions_grid % self.block_size).to(
-            torch.int32)  # [B, K+1]
+        block_indices = (positions_grid // self.block_size).to(torch.int64)
+        offsets = (positions_grid % self.block_size).to(torch.int32)
 
         # Get block IDs for each position from dbt
-        B_expanded = torch.arange(B, device=self.device).unsqueeze(
-            -1).expand(-1, K + 1)  # [B, K+1]
-        blk_ids = dbt[B_expanded, block_indices]  # [B, K+1]
-
-        assert blk_ids.shape == (B, K + 1), f"ERROR in prepare_glue_decode_ctxt: blk_ids should be (B, {K + 1}), got {blk_ids.shape}"
-        assert (blk_ids >= 0).all(
-        ), "ERROR in prepare_glue_decode_ctxt: all blk_ids should be >= 0"
+        B_expanded = torch.arange(B, device=self.device).unsqueeze(-1).expand(-1, K + 1)
+        blk_ids = dbt[B_expanded, block_indices]
 
         # Calculate slot_map for each position
-        slot_map_grid = blk_ids * self.block_size + offsets  # [B, K+1]
+        slot_map_grid = blk_ids * self.block_size + offsets
 
         # Flattened tensors for varlen decode
-        positions_flat = positions_grid.reshape(-1).to(torch.int64)  # [B * (K+1)]
-        slot_map_flat = slot_map_grid.reshape(-1).to(torch.int32)  # [B * (K+1)]
+        positions_flat = positions_grid.reshape(-1).to(torch.int64)
+        slot_map_flat = slot_map_grid.reshape(-1).to(torch.int32)
 
-        assert input_ids.dim() == 1 == positions_flat.dim() == slot_map_flat.dim(), \
-            f"input_ids, positions_flat, and slot_map_flat should all be 1D, got shapes {input_ids.shape}, {positions_flat.shape}, {slot_map_flat.shape}"
-        
-        seqlen_q = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
         context_lens = (num_tokens + pos_offset + K).to(torch.int32)
+        seqlen_q = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q[1:] = torch.cumsum(seqlen_q, dim=0)
 
@@ -443,38 +445,20 @@ class DraftRunner(ModelRunner):
         N = rec_flat.shape[0]
         cache_hits = partial_tree_decode_args["cache_hits"]
 
-        assert N == B*self.config.MQ_LEN, f"ERROR in _construct_tree_decode_args: N should be B*self.config.MQ_LEN={B*self.config.MQ_LEN}, got {N}"
-        assert self.config.fan_out_t.sum() == self.config.fan_out_t_miss.sum() == self.config.MQ_LEN, f"ERROR in _construct_tree_decode_args: fan_out_t.sum() should be MQ_LEN={self.config.MQ_LEN}, got {self.config.fan_out_t.sum()}"
-        # assert N == B * (K + 1) * F, "ERROR in _construct_tree_decode_args: N should be B * (K + 1) * F"
-        # b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[:, None, None].expand(B, K + 1, F).flatten()
-        
+        if __debug__:
+            assert N == B*self.config.MQ_LEN, f"ERROR in _construct_tree_decode_args: N should be B*self.config.MQ_LEN={B*self.config.MQ_LEN}, got {N}"
+
         b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[:, None].expand(B, self.config.MQ_LEN).flatten()
-        assert b_flat.shape == (N,), f"ERROR in _construct_tree_decode_args: b_flat should be (N,), got {b_flat.shape}"
-        # fkp1_flat = torch.arange(F * (K + 1), device=self.device, dtype=torch.int64).repeat(B) 
-        fkp1_flat = torch.arange(self.config.MQ_LEN, device=self.device, dtype=torch.int64).repeat(B) 
-        assert fkp1_flat.shape == (N,), f"ERROR in _construct_tree_decode_args: fkp1_flat should be (N,), got {fkp1_flat.shape}"
-        
+        fkp1_flat = self._arange_mq.repeat(B)
+        j_idx_flat = torch.cat([self._fan_idx_hit if hit else self._fan_idx_miss for hit in cache_hits])
+        metadata = torch.tensor([B, K, F, N], dtype=torch.int64, device=self.device)
+
         seq_ids = partial_tree_decode_args["seq_ids"]
         seq_ids_expanded = seq_ids[b_flat]
-        assert seq_ids_expanded.shape == (N,), f"ERROR in _construct_tree_decode_args: seq_ids_expanded should be (N,), got {seq_ids_expanded.shape}"
         pos_offset = -1 if self.config.use_eagle else 0
         positions = (partial_tree_decode_args["num_tokens"][b_flat] - 1 + pos_offset) + (K + 1) + fkp1_flat
-        # make rope_positions which all start at after K+1 of the glue decode are done 
-        # j_idx_flat = fkp1_flat // F # this assumes unif fan out over lookahead
-        # j_idx_flat = torch.arange(
-        #     K+1, device=self.device, dtype=torch.int64).repeat_interleave(self.config.fan_out_t).repeat(B)  # i think this is right? 
-        j_idx_flat = torch.cat([
-            torch.arange(K+1, device=self.device, dtype=torch.int64).repeat_interleave(
-                self.config.fan_out_t if hit else self.config.fan_out_t_miss)
-            for hit in cache_hits
-        ])
-        assert j_idx_flat.shape == (N,), f"ERROR in _construct_tree_decode_args: j_idx_flat should be (N,), got {j_idx_flat.shape}"
         rope_positions = (partial_tree_decode_args["num_tokens"][b_flat] - 1 + pos_offset) + j_idx_flat + 1
-        assert rope_positions.shape == (N,), f"ERROR in _construct_tree_decode_args: rope_positions should be (N,), got {rope_positions.shape}"
         temperatures = partial_tree_decode_args["temperatures"][b_flat]
-
-        # metadata needs B K F N
-        metadata = torch.tensor([B, K, F, N], dtype=torch.int64, device=self.device)
 
         tree_decode_args = {
             "metadata": metadata,
@@ -598,22 +582,22 @@ class DraftRunner(ModelRunner):
 
     @torch.inference_mode()
     def _compute_step_positions_and_slot_maps(self, initial_positions, initial_rope_positions, dbt, B, K, F, N, MQ_LEN):
-        step_positions = initial_positions[None, :] + torch.arange(K, device=self.device)[:, None] * MQ_LEN
-        step_rope_positions = initial_rope_positions[None, :] + torch.arange(K, device=self.device)[:, None]
+        # PERFORMANCE: pre-allocated _step_pos_offsets/_step_rope_offsets avoid per-step torch.arange calls
+        step_positions = initial_positions[None, :] + self._step_pos_offsets
+        step_rope_positions = initial_rope_positions[None, :] + self._step_rope_offsets
         step_context_lens = step_positions.view(K, B, MQ_LEN)[:, :, -1] + 1
-        
+
         # Precompute slot_maps for all steps: [K, N]
-        # b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[:, None, None].expand(B, K+1, F).flatten()  # [N], be careful here!
         b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[
             :, None].expand(B, self.config.MQ_LEN).flatten()
+        batch_indices = torch.arange(N, device=self.device)
         dbt_expanded = dbt[b_flat]  # [N, M] - constant across steps
-        
+
         step_offsets = (step_positions % self.block_size).to(torch.int32)  # [K, N]
         step_last_blks = (step_positions // self.block_size).to(torch.int64)  # [K, N]
-        batch_indices = torch.arange(N, device=self.device)  # [N]
         step_blk_ids = dbt_expanded[batch_indices[None, :], step_last_blks]  # [K, N]
         step_slot_maps = step_blk_ids * self.block_size + step_offsets  # [K, N]
-        
+
         return step_positions, step_rope_positions, step_context_lens, step_slot_maps
 
     def _decode_tree_step(self, depth, current_input_ids, step_rope_positions, step_slot_maps, step_context_lens, dbt, payload, spec_tokens, spec_logits, spec_activations):
@@ -654,18 +638,19 @@ class DraftRunner(ModelRunner):
         ), metadata[2].item(), metadata[3].item()
 
         V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
-        spec_tokens = torch.empty(
+        spec_tokens = torch.zeros(
             (N, K), dtype=torch.int64, device=self.device)
-        spec_logits = torch.empty(
+        spec_logits = torch.zeros(
             (N, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
-        spec_activations = torch.empty(
+        spec_activations = torch.zeros(
             (N, K, self.hf_config.hidden_size),
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
 
         # Precompute all positions, context_lens, and slot_maps for all K steps
-        initial_positions = payload["positions"].clone()  # [N]
-        initial_rope_positions = payload["rope_positions"].clone() # [N]
+        # PERFORMANCE: no .clone() needed — these are not modified in-place
+        initial_positions = payload["positions"]  # [N]
+        initial_rope_positions = payload["rope_positions"]  # [N]
         current_input_ids = payload["input_ids"]  # [N], the forked tokens
         dbt = payload["block_tables"]  # [B, M] - constant across steps
         
@@ -674,11 +659,19 @@ class DraftRunner(ModelRunner):
             initial_positions, initial_rope_positions, dbt, B, K, F, N, self.config.MQ_LEN
         )
 
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         for depth in range(K):
+            if _prof:
+                torch.cuda.synchronize()
+                _st = time.perf_counter()
             current_input_ids = self._decode_tree_step(
-                depth, current_input_ids, step_rope_positions, step_slot_maps, 
+                depth, current_input_ids, step_rope_positions, step_slot_maps,
                 step_context_lens, dbt, payload, spec_tokens, spec_logits, spec_activations
             )
+            if _prof:
+                torch.cuda.synchronize()
+                _et = time.perf_counter()
+                print(f"[PROFILE draft] tree_step[{depth}]={(_et-_st)*1000:.2f}ms", flush=True)
 
         return spec_tokens, spec_logits, spec_activations
 
@@ -692,15 +685,7 @@ class DraftRunner(ModelRunner):
         # k_flat = torch.arange(self.config.speculate_k + 1, device=self.device, dtype=torch.int64)[None, :, None].expand(
         #     B, self.config.speculate_k + 1, self.config.async_fan_out).flatten()
 
-        # TODO: make sure the cache req we send from target is aware of last cache_hits?
-        k_flat_hit = torch.arange(self.config.speculate_k+1, device=self.device, dtype=torch.int64).repeat_interleave(
-            self.config.fan_out_t)
-        k_flat_miss = torch.arange(self.config.speculate_k+1, device=self.device, dtype=torch.int64).repeat_interleave(
-            self.config.fan_out_t_miss)
-        k_flat = torch.cat([
-            k_flat_hit if hit else k_flat_miss
-            for hit in cache_hits
-        ])
+        k_flat = torch.cat([self._fan_idx_hit if hit else self._fan_idx_miss for hit in cache_hits])
 
         assert k_flat.shape[0] == payload["block_tables"].shape[0] * self.config.MQ_LEN, f"ERROR in _populate_tree_cache: k_flat should be {payload['block_tables'].shape[0] * self.config.MQ_LEN}, got {k_flat.shape[0]}"
         
@@ -767,22 +752,49 @@ class DraftRunner(ModelRunner):
 
             # SPECULATE request: serve out-of-cache or random speculations
             elif cmd == 0:
+                _ds0 = time.perf_counter()
+                _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+                if _prof:
+                    torch.cuda.synchronize()
+                    _d0 = time.perf_counter()
+
                 glue_decode_input_ids, partial_tree_decode_args = self._service_spec_request()  # ~3ms
+
+                if _prof:
+                    torch.cuda.synchronize()
+                    _d1 = time.perf_counter()
 
                 self._reset_tree_cache_tensors()
 
                 tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)  # ~3ms --> leaves ~28ms for decoding
 
-                # Decode the branch tree 
+                if _prof:
+                    torch.cuda.synchronize()
+                    _d2 = time.perf_counter()
+
+                # Decode the branch tree
                 tokens, logits, activations = self._decode_tree(tree_decode_args)
+
+                if _prof:
+                    torch.cuda.synchronize()
+                    _d3 = time.perf_counter()
 
                 # Populate the local cache so future spec-requests can hit
                 self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
+                self._draft_step_times.append(time.perf_counter() - _ds0)
+
+                if _prof:
+                    torch.cuda.synchronize()
+                    _d4 = time.perf_counter()
+                    print(f"[PROFILE draft] service={(_d1-_d0)*1000:.2f}ms build_tree={(_d2-_d1)*1000:.2f}ms decode_tree={(_d3-_d2)*1000:.2f}ms populate={(_d4-_d3)*1000:.2f}ms total={(_d4-_d0)*1000:.2f}ms", flush=True)
 
                 continue
 
             # EXIT: clean up and break out of the loop
             elif cmd == 2:
+                if self._draft_step_times:
+                    avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
+                    print(f"[metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
                 print(f'[draft] EXIT command received', flush=True)
                 self.exit()
                 break

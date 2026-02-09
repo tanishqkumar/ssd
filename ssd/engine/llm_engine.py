@@ -32,7 +32,7 @@ METRICS = {
     "prefill_total_tokens": 0,
     "decode_total_tokens": 0,
     "target_step_times": [],
-    "num_spec_steps": [],
+    "target_verify_times": [],
 }
 
 
@@ -216,6 +216,9 @@ class LLMEngine:
                 f"[metrics] Avg Fraction of Speculated Tokens Accepted: {avg_acceptance_rate:.2f}", flush=True)
             print(
                 f"[metrics] Avg target time per full step (ms): {sum(METRICS['target_step_times']) * 1000 / len(METRICS['target_step_times']):.2f}", flush=True)
+            if METRICS['target_verify_times']:
+                print(
+                    f"[metrics] Avg target verify time (ms): {sum(METRICS['target_verify_times']) * 1000 / len(METRICS['target_verify_times']):.2f}", flush=True)
             if self.config.draft_async:
                 print(
                     f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
