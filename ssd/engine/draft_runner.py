@@ -40,6 +40,7 @@ class DraftRunner(ModelRunner):
         if self.is_draft and self.draft_async:
             self._reset_tree_cache_tensors()
             self._init_prealloc_buffers()
+            self._draft_step_times = []
             print(f'DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
 
@@ -637,11 +638,11 @@ class DraftRunner(ModelRunner):
         ), metadata[2].item(), metadata[3].item()
 
         V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
-        spec_tokens = torch.empty(
+        spec_tokens = torch.zeros(
             (N, K), dtype=torch.int64, device=self.device)
-        spec_logits = torch.empty(
+        spec_logits = torch.zeros(
             (N, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
-        spec_activations = torch.empty(
+        spec_activations = torch.zeros(
             (N, K, self.hf_config.hidden_size),
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
@@ -751,6 +752,7 @@ class DraftRunner(ModelRunner):
 
             # SPECULATE request: serve out-of-cache or random speculations
             elif cmd == 0:
+                _ds0 = time.perf_counter()
                 _prof = os.environ.get("SSD_PROFILE", "0") == "1"
                 if _prof:
                     torch.cuda.synchronize()
@@ -779,6 +781,7 @@ class DraftRunner(ModelRunner):
 
                 # Populate the local cache so future spec-requests can hit
                 self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
+                self._draft_step_times.append(time.perf_counter() - _ds0)
 
                 if _prof:
                     torch.cuda.synchronize()
@@ -789,6 +792,9 @@ class DraftRunner(ModelRunner):
 
             # EXIT: clean up and break out of the loop
             elif cmd == 2:
+                if self._draft_step_times:
+                    avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
+                    print(f"[metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
                 print(f'[draft] EXIT command received', flush=True)
                 self.exit()
                 break
