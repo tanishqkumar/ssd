@@ -102,7 +102,7 @@ class SpecDecodeStep(InferenceStep):
         in_verify_result = VerifyResult(
             new_suffixes=[],
             recovery_tokens=[],
-            eagle_acts=None,
+            eagle_acts=None,  # TODO: pass target activations here when we fix Eagle implementation.
         )
         #### STEP 1: SPECULATE ####
         speculate_result = self.speculator.speculate(seqs_copy, in_verify_result)
