@@ -12,6 +12,7 @@ from ssd.engine.model_runner import ModelRunner
 from ssd.engine.draft_runner import DraftRunner
 from ssd.engine.helpers.runner_helpers import prepare_prefill_tensors_from_seqs
 from ssd.utils.verify import verify
+from ssd.utils.misc import decode_tokens
 
 import atexit
 from dataclasses import fields
@@ -367,6 +368,14 @@ class LLMEngine:
         temperatures_draft = torch.tensor(
             temps_draft, dtype=torch.float32, device=self.config.device)
 
+        if __debug__:
+            print(f"[LLMEngine.verify] speculations: {speculations}", flush=True)
+            speculations_list = speculations.tolist()
+            for i, speculation in enumerate(speculations_list):
+                decoded_tokens = decode_tokens(speculation, self.tokenizer)
+                print(f"[LLMEngine.verify] speculation {i}: {decoded_tokens}", flush=True)
+
+
         # TODO: this will need to work with fan_out_list/fan_out_list_miss? 
         if self.config.sampler_x is not None:
             assert self.config.fan_out_list == self.config.fan_out_list_miss == [self.config.async_fan_out] * (self.config.speculate_k + 1), "fan_out_list and fan_out_list_miss must be the same if sampler_x is provided"
@@ -552,12 +561,19 @@ class LLMEngine:
                 f"[PREFILL] seq0 prompt_len={seqs[0].num_prompt_tokens} recovery={seqs[0].recovery_token_id}", flush=True)
 
     def normal_step(self, seqs: list[Sequence], is_prefill: bool):
+        if __debug__:
+            print(f'[normal_step] is_prefill={is_prefill}', flush=True)
         # this includes prepare_decode, set_context, etc
         result = self.model_runner.call("run", seqs, is_prefill)
         if self.config.use_eagle and isinstance(result, tuple):
             token_ids, _ = result
         else:
             token_ids = result
+
+        if __debug__:
+            decoded_tokens = decode_tokens(token_ids, self.tokenizer)
+            print(f"[normal_step] generated tokens: {decoded_tokens}", flush=True)
+
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
 
     def async_spec_step(self, seqs: list[Sequence]):
@@ -705,7 +721,15 @@ class LLMEngine:
             self.add_request(prompt, sp)
 
         outputs = {}
-        while not self.is_finished():
+        i = 0
+        max_steps = self.config.max_steps if self.config.max_steps is not None else float('inf')
+        while not self.is_finished() and i < max_steps:
+            if self.config.verbose:
+                print(f"[generate] step {i+1}" +
+                    f" of {max_steps}" if max_steps != float('inf') else "",
+                    flush=True,
+                )
+            i += 1
             t = perf_counter()
             output = self.step()
             time_taken = perf_counter() - t
