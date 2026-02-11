@@ -66,8 +66,6 @@ while i < len(sections):
     gen_blocks = re.findall(r'Prompt (\d+):.*?Generation: (.*?)(?:\n-{20,}|\nPrompt|\Z)', body, re.DOTALL)
     for num, g in gen_blocks[:2]:
         text = g.strip().strip(\"'\").strip('\"')
-        if len(text) > 200:
-            text = text[:200] + '...'
         gens.append((num, text))
 
     print(f'### {header}')
