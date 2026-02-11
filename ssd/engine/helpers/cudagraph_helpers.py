@@ -1,47 +1,99 @@
+import os
 import torch
 from typing import List
 from ssd.utils.context import set_context, get_context, reset_context
 from ssd.engine.helpers.mask_helpers import get_custom_mask
-from flashinfer.quantization import segment_packbits 
+from flashinfer.quantization import get_quantization_module
 from time import perf_counter
+
+
+# PERFORMANCE: CPU-side mask indptr avoids GPU->CPU sync inside FlashInfer plan().
+# Replicates FlashInfer's _compute_page_mask_indptr using only CPU tensors.
+def _compute_page_mask_indptr_cpu(qo_indptr, paged_kv_indptr, paged_kv_last_page_len, page_size):
+    mask_indptr = torch.empty_like(qo_indptr)
+    mask_indptr[0] = 0
+    mask_indptr[1:] = torch.cumsum(
+        (qo_indptr[1:] - qo_indptr[:-1])
+        * ((paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size + paged_kv_last_page_len),
+        0,
+    )
+    return mask_indptr
+
+
+# PERFORMANCE: segment_packbits with CPU-computed metadata avoids GPU->CPU .item() sync.
+# FlashInfer's segment_packbits calls indptr_new[-1].item() on a GPU tensor = sync point.
+# We compute indptr_new on CPU first, then transfer to GPU async.
+def _segment_packbits_no_sync(x_gpu, mask_indptr_cpu, bitorder="little"):
+    device = x_gpu.device
+    indptr_cpu = mask_indptr_cpu.to(torch.int32)
+    seglen = indptr_cpu[1:] - indptr_cpu[:-1]
+    packed_len = (seglen + 7) // 8
+    indptr_new_cpu = torch.zeros(len(indptr_cpu), dtype=torch.int32)
+    indptr_new_cpu[1:] = torch.cumsum(packed_len, 0)
+    output_nnzs = int(indptr_new_cpu[-1].item())
+    indptr_gpu = indptr_cpu.to(device, non_blocking=True)
+    indptr_new_gpu = indptr_new_cpu.to(device, non_blocking=True)
+    y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
+    get_quantization_module().segment_packbits(x_gpu, indptr_gpu, indptr_new_gpu, bitorder, y)
+    return y, indptr_new_gpu
+
 
 ## RUN CUDAGRAPHS
 @torch.inference_mode()
 def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_vars):
     context = get_context()
     k_plus_1 = model_runner.config.speculate_k + 1
-    bs = input_ids.size(0) // k_plus_1  # bs = N here
+    orig_bs = input_ids.size(0) // k_plus_1  # orig_bs = N here
 
-    graph = model_runner.graphs["verify"][next(
-        x for x in model_runner.graph_bs_list["verify"] if x >= bs)]
+    wrapper_bs = next(
+        x for x in model_runner.graph_bs_list["verify"] if x >= orig_bs)
+    graph = model_runner.graphs["verify"][wrapper_bs]
 
     for k, v in graph_vars.items():
         if k != "outputs":
             v.zero_()
 
-    # Reshape 1D tensors to 2D before assignment
-    # Assert that slot_mapping contains unique values (no duplicates)
-    assert len(context.slot_mapping) == len(torch.unique(context.slot_mapping)), \
-        f"slot_mapping contains duplicate values: {context.slot_mapping}"
+    # Pad to graph bucket size if needed (fixes B>=6 crash from non-monotonic cu_seqlens_q)
+    if wrapper_bs > orig_bs:
+        pad_bs = wrapper_bs - orig_bs
+        pad_flat = pad_bs * k_plus_1
+        dev = input_ids.device
+
+        input_ids = torch.cat([input_ids, torch.zeros(pad_flat, dtype=input_ids.dtype, device=dev)])
+        positions = torch.cat([positions, torch.zeros(pad_flat, dtype=positions.dtype, device=dev)])
+        slot_mapping = torch.cat([
+            context.slot_mapping,
+            torch.full((pad_flat,), -1, dtype=context.slot_mapping.dtype, device=dev)])
+        # Repeat last real row for ghost sequences (valid page table / context len)
+        bt = context.block_tables
+        cl = context.context_lens
+        block_tables = torch.cat([bt, bt[orig_bs-1:orig_bs].expand(pad_bs, -1).contiguous()])
+        context_lens = torch.cat([cl, cl[orig_bs-1:orig_bs].expand(pad_bs).contiguous()])
+        bs = wrapper_bs
+    else:
+        slot_mapping = context.slot_mapping
+        block_tables = context.block_tables
+        context_lens = context.context_lens
+        bs = orig_bs
+
     graph_vars["input_ids"][:bs * k_plus_1] = input_ids
     graph_vars["positions"][:bs * k_plus_1] = positions
-    graph_vars["slot_mapping"][:bs * k_plus_1] = context.slot_mapping
-    graph_vars["context_lens"][:bs] = context.context_lens
-    # Construct cu_seqlens_q here instead of assuming it's set in context
+    graph_vars["slot_mapping"][:bs * k_plus_1] = slot_mapping
+    graph_vars["context_lens"][:bs] = context_lens
+    # Construct cu_seqlens_q for FULL padded batch (monotonically increasing)
     seqlen_q = torch.full(
         (bs,), k_plus_1, dtype=torch.int32, device=graph_vars["cu_seqlens_q"].device)
     cu = graph_vars["cu_seqlens_q"][:bs + 1]
     cu.zero_()
     cu[1:].copy_(torch.cumsum(seqlen_q, 0))
 
-    if context.block_tables is not None:
-        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+    if block_tables is not None:
+        graph_vars["block_tables"][:bs, :block_tables.size(1)] = block_tables
 
     graph.replay() # [1.35ms/1.85ms]
 
-    # Extract outputs for the actual batch size and reshape if needed
-    # [bs * (k+1), hidden_size]
-    outputs = graph_vars["outputs"][:bs * k_plus_1]
+    # Extract outputs for the ORIGINAL batch size only
+    outputs = graph_vars["outputs"][:orig_bs * k_plus_1]
     return model_runner.model.compute_logits(outputs, last_only)
 
 
@@ -53,7 +105,7 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
 
     graph = model_runner.graphs["decode"][next(
         x for x in model_runner.graph_bs_list["decode"] if x >= flat_batch_size)]
-    
+
     for k, v in graph_vars.items():
             if k != "outputs":
                 v.zero_()
@@ -62,12 +114,12 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     graph_vars["positions"][:flat_batch_size] = positions
     graph_vars["slot_mapping"][:flat_batch_size] = context.slot_mapping
     graph_vars["context_lens"][:flat_batch_size] = context.context_lens
-    
+
     if context.block_tables is not None:
         graph_vars["block_tables"][:flat_batch_size,
                                 :context.block_tables.size(1)] = context.block_tables
 
-    graph.replay() # 32b is 23ms, 0.6b is 1.6ms [qwen, tp=1]. 10ms on tp=4. 
+    graph.replay() # 32b is 23ms, 0.6b is 1.6ms [qwen, tp=1]. 10ms on tp=4.
 
 
     outputs = graph_vars["outputs"][:flat_batch_size]
@@ -79,7 +131,7 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
 
 cache = {}
 
-PROFILE = False
+PROFILE = os.environ.get("SSD_PROFILE", "0") == "1"
 
 @torch.inference_mode()
 def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits):
@@ -148,18 +200,103 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         end_time = torch.cuda.Event(enable_timing=True)
         start_time.record()
 
-    # in the case where we pad, we'll need cache_hits.shape[0] to match the padded batch size, we don't care about those last entries 
-        # since we won't use them 
-    if cache_hits.shape[0] < B: 
+    # in the case where we pad, we'll need cache_hits.shape[0] to match the padded batch size
+    if cache_hits.shape[0] < B:
         cache_hits = torch.cat([cache_hits, torch.zeros(B - cache_hits.shape[0], device=cache_hits.device)])
-    custom_mask = get_custom_mask(
-        model_runner.config, context_lens, step, K, F, B, device=model_runner.device, cache_hits=cache_hits)
+
+    # PERFORMANCE: Step 0 -- precompute KV page metadata on CPU for all K steps.
+    # CPU tensors let plan() skip its internal .to("cpu") GPU->CPU syncs.
+    # For B<=8, CPU slicing also avoids GPU boolean indexing.
+    if step == 0:
+        cache["cu_seqlens_q_cpu"] = torch.arange(B + 1, dtype=torch.int32) * MQ_LEN
+        context_lens_list = context_lens.tolist()
+        cache["block_tables"] = block_tables
+        block_size = model_runner.block_size
+        cache["precomputed_kv"] = []
+        cache["plan_cpu_args"] = []
+
+        if B <= 8:
+            # PERFORMANCE: CPU-only kv_indices via slicing (no GPU boolean indexing)
+            for s in range(K):
+                step_cls = [int(cl) + s * MQ_LEN for cl in context_lens_list]
+                step_counts = [(cl + block_size - 1) // block_size for cl in step_cls]
+                if B == 1:
+                    kv_indices_s = block_tables[0, :step_counts[0]]
+                else:
+                    kv_indices_s = torch.cat([block_tables[b, :step_counts[b]] for b in range(B)])
+                cache["precomputed_kv"].append(kv_indices_s)
+                kv_indptr_cpu = torch.zeros(B + 1, dtype=torch.int32)
+                kv_indptr_cpu[1:] = torch.tensor(step_counts, dtype=torch.int32).cumsum(0)
+                kv_lpl_cpu = torch.tensor(
+                    [cl % block_size if cl % block_size != 0 else block_size for cl in step_cls],
+                    dtype=torch.int32)
+                cache["plan_cpu_args"].append((kv_indptr_cpu, kv_lpl_cpu))
+        else:
+            # Large batch: GPU boolean indexing for kv_indices, CPU tensors for plan args
+            bt_upcast = torch.arange(block_tables.size(1), device=block_tables.device)[None, :]
+            step_offsets = torch.arange(K + 2, device=context_lens.device) * MQ_LEN
+            all_step_cls = context_lens.unsqueeze(1) + step_offsets.unsqueeze(0)
+            all_counts = (all_step_cls + block_size - 1) // block_size
+            all_masks = bt_upcast.unsqueeze(1) < all_counts.unsqueeze(2)
+            for s in range(K):
+                cache["precomputed_kv"].append(block_tables[all_masks[:, s, :]])
+                step_cls = [int(cl) + s * MQ_LEN for cl in context_lens_list]
+                step_counts = [(cl + block_size - 1) // block_size for cl in step_cls]
+                kv_indptr_cpu = torch.zeros(B + 1, dtype=torch.int32)
+                kv_indptr_cpu[1:] = torch.tensor(step_counts, dtype=torch.int32).cumsum(0)
+                kv_lpl_cpu = torch.tensor(
+                    [cl % block_size if cl % block_size != 0 else block_size for cl in step_cls],
+                    dtype=torch.int32)
+                cache["plan_cpu_args"].append((kv_indptr_cpu, kv_lpl_cpu))
 
     if PROFILE:
         end_time.record()
         torch.cuda.synchronize()
-        mask_time = start_time.elapsed_time(end_time)
+        precompute_time = start_time.elapsed_time(end_time)
+        start_time.record()
 
+    # Sync-free plan: call C++ plan directly, skip Python plan()'s 3 GPU syncs
+    kv_indices = cache["precomputed_kv"][step]
+    kv_indptr_cpu, kv_lpl_cpu = cache["plan_cpu_args"][step]
+    qo_indptr_cpu = cache["cu_seqlens_q_cpu"]
+
+    custom_mask = get_custom_mask(
+        model_runner.config, context_lens, step, K, F, B,
+        device=model_runner.device, cache_hits=cache_hits)
+    mask_indptr_cpu = _compute_page_mask_indptr_cpu(
+        qo_indptr_cpu, kv_indptr_cpu, kv_lpl_cpu, model_runner.block_size)
+    packed_mask, packed_indptr_gpu = _segment_packbits_no_sync(
+        custom_mask.contiguous().view(-1), mask_indptr_cpu)
+
+    wrapper._custom_mask_buf[:len(packed_mask)].copy_(packed_mask, non_blocking=True)
+    wrapper._mask_indptr_buf.copy_(packed_indptr_gpu, non_blocking=True)
+    wrapper._qo_indptr_buf.copy_(qo_indptr_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
+    wrapper._paged_kv_indptr_buf.copy_(kv_indptr_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
+    wrapper._paged_kv_last_page_len_buf.copy_(kv_lpl_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
+    wrapper._paged_kv_indices_buf[:len(kv_indices)].copy_(kv_indices, non_blocking=True)
+
+    kv_lens_cpu = ((kv_indptr_cpu[1:] - kv_indptr_cpu[:-1] - 1) * model_runner.block_size + kv_lpl_cpu).to(torch.int32)
+    total_num_rows = int(qo_indptr_cpu[-1].item())
+    wrapper._kv_lens_buffer[:len(kv_lens_cpu)].copy_(kv_lens_cpu, non_blocking=True)
+    plan_args = [
+        wrapper._float_workspace_buffer, wrapper._int_workspace_buffer,
+        wrapper._pin_memory_int_workspace_buffer,
+        qo_indptr_cpu, kv_indptr_cpu, kv_lens_cpu,
+        wrapper._max_total_num_rows or total_num_rows,
+        B, model_runner.hf_config.num_attention_heads,
+        model_runner.hf_config.num_key_value_heads,
+        model_runner.block_size, wrapper.is_cuda_graph_enabled,
+        model_runner.hf_config.head_dim, model_runner.hf_config.head_dim,
+        False, -1,
+    ]
+    if wrapper._backend == "fa2":
+        plan_args.extend([-1, False])
+    wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
+
+    if PROFILE:
+        end_time.record()
+        torch.cuda.synchronize()
+        plan_time = start_time.elapsed_time(end_time)
         start_time.record()
 
     # Copy inputs/context into graph buffers for padded size
@@ -167,81 +304,13 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     graph_vars["positions"][:flat_batch_size] = positions
     graph_vars["slot_mapping"][:flat_batch_size] = get_context().slot_mapping
     graph_vars["context_lens"][:B] = context_lens
-    if step == 0: 
-        graph_vars["block_tables"][:B, :block_tables.size(1)] = block_tables
-
-    # On step 0, precompute KV tensors for all steps in a vectorized way
     if step == 0:
-        # Cache cu_seqlens_q (constant across steps)
-        cache["cu_seqlens_q"] = torch.arange(B + 1, device=model_runner.device, dtype=torch.int32) * MQ_LEN
-        cache["bt_upcast"] = torch.arange(block_tables.size(1), device=block_tables.device)[None, :]
-        
-        # Vectorized precomputation for all steps
-        max_steps = K + 1  # Assuming we need up to K+1 steps
-        
-        # Create step offsets: [0, MQ_LEN, 2*MQ_LEN, ..., max_steps*MQ_LEN]
-        step_offsets = torch.arange(max_steps + 1, device=context_lens.device) * MQ_LEN  # [max_steps+1]
-        
-        # Broadcast context_lens and step_offsets to compute all step context_lens at once
-        # context_lens: [B] -> [B, 1], step_offsets: [max_steps+1] -> [1, max_steps+1]
-        # Result: [B, max_steps+1]
-        all_step_context_lens = context_lens.unsqueeze(1) + step_offsets.unsqueeze(0)
-        
-        # Compute counts for all steps: [B, max_steps+1]
-        all_counts = (all_step_context_lens + model_runner.block_size - 1) // model_runner.block_size
-        
-        # Compute masks for all steps: [B, max_steps+1, num_blocks]
-        all_masks = cache["bt_upcast"].unsqueeze(1) < all_counts.unsqueeze(2)  # [1, 1, num_blocks] < [B, max_steps+1, 1]
-        
-        # Compute kv_last_page_len for all steps: [B, max_steps+1]
-        all_kv_last_page_len = all_step_context_lens % model_runner.block_size
-        all_kv_last_page_len[all_kv_last_page_len == 0] = model_runner.block_size
-        all_kv_last_page_len = all_kv_last_page_len.to(torch.int32)
-        
-        # Compute kv_indptr for all steps: [B, max_steps+1]
-        all_kv_indptr_counts = all_counts.cumsum(dim=0)  # [B, max_steps+1]
-        # Prepend zeros for each step: [B+1, max_steps+1]
-        zeros_row = torch.zeros(1, max_steps + 1, device=all_counts.device, dtype=all_counts.dtype)
-        all_kv_indptr = torch.cat([zeros_row, all_kv_indptr_counts], dim=0).to(torch.int32)
-        
-        # Store precomputed tensors
-        cache["all_masks"] = all_masks
-        cache["all_kv_last_page_len"] = all_kv_last_page_len
-        cache["all_kv_indptr"] = all_kv_indptr
-        cache["block_tables"] = block_tables
-    
-    # Use precomputed tensors for current step (views into the big tensors)
-    step_mask = cache["all_masks"][:, step, :]  # [B, num_blocks]
-    kv_indices = cache["block_tables"][step_mask]  # flattened page ids
-    kv_last_page_len = cache["all_kv_last_page_len"][:, step]  # [B]
-    kv_indptr = cache["all_kv_indptr"][:, step]  # [B+1]
+        graph_vars["block_tables"][:B, :block_tables.size(1)] = block_tables
 
     if PROFILE:
         end_time.record()
         torch.cuda.synchronize()
         buffer_prep_time = start_time.elapsed_time(end_time)
-
-        start_time.record()
-
-    wrapper.plan(
-        cache["cu_seqlens_q"],
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        model_runner.hf_config.num_attention_heads,
-        model_runner.hf_config.num_key_value_heads,
-        model_runner.hf_config.head_dim,
-        model_runner.block_size,
-        custom_mask=custom_mask,
-        q_data_type=torch.bfloat16,
-        kv_data_type=torch.bfloat16,
-    )
-        
-    if PROFILE:
-        end_time.record()
-        torch.cuda.synchronize()
-        plan_time = start_time.elapsed_time(end_time)
-
         start_time.record()
 
     graph.replay()
@@ -255,7 +324,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     logits_all = graph_vars["logits"][:flat_batch_size]
 
     if PROFILE:
-        print(f"[run_fi_tree_decode_cudagraph] step {step}: mask={mask_time:.3f}ms, buffer_prep={buffer_prep_time:.3f}ms, plan={plan_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
+        print(f"[run_fi_tree_decode_cudagraph] step {step}: precompute={precompute_time:.3f}ms, plan={plan_time:.3f}ms, buffer={buffer_prep_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
 
     return logits_all[:orig_flat]
 
@@ -328,7 +397,7 @@ def capture_cudagraph(model_runner):
         block_tables=block_tables,
         outputs=outputs,
     )
-    
+
     return graph_vars, graph_pool, graphs, graph_bs_list
 
 
@@ -386,7 +455,7 @@ def capture_verify_cudagraph(model_runner):
             # capture
             outputs[:bs * k_plus_1] = model_runner.model(
                 input_ids[:bs * k_plus_1], positions[:bs * k_plus_1])
-            
+
         if graph_pool is None:
             graph_pool = graph.pool()
         graphs[bs] = graph
@@ -419,14 +488,14 @@ def capture_fi_tree_decode_cudagraph(model_runner):
 
     max_num_blocks = (config.max_model_len +
                       model_runner.block_size - 1) // model_runner.block_size
-    input_ids = torch.zeros(max_flat_batch_size, dtype=torch.int64, device=model_runner.device) 
+    input_ids = torch.zeros(max_flat_batch_size, dtype=torch.int64, device=model_runner.device)
     positions = torch.zeros(max_flat_batch_size, dtype=torch.int64, device=model_runner.device)
     slot_mapping = torch.zeros(max_flat_batch_size, dtype=torch.int32, device=model_runner.device)
-    context_lens = torch.full((max_bs,), config.max_model_len, dtype=torch.int32, device=model_runner.device) # make sure these are consistent with our dummy example 
+    context_lens = torch.full((max_bs,), config.max_model_len, dtype=torch.int32, device=model_runner.device) # make sure these are consistent with our dummy example
     block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=model_runner.device)
     outputs = torch.empty(max_flat_batch_size, hf_config.hidden_size, device=model_runner.device)
     logits = torch.empty(max_flat_batch_size, hf_config.vocab_size, device=model_runner.device)
-    
+
     # Create graph_bs_list to match what will be used in cudagraph_helpers.py
     graph_bs_list = [1]
     for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
@@ -440,7 +509,7 @@ def capture_fi_tree_decode_cudagraph(model_runner):
     graph_pool = None
 
     print(f'About to capture FI cudagraphs for bs={graph_bs_list}', flush=True)
-    
+
     for bs in reversed(graph_bs_list):
         graph = torch.cuda.CUDAGraph()
 
@@ -468,7 +537,7 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         model_runner.prefill_wrappers[bs].plan(
             cu_seqlens_q,
             kv_indptr,
-            kv_indices, 
+            kv_indices,
             kv_last_page_len,
             hf_config.num_attention_heads,
             hf_config.num_key_value_heads,
@@ -481,8 +550,8 @@ def capture_fi_tree_decode_cudagraph(model_runner):
 
         # Set minimal context needed for run
         set_context(
-            is_prefill=False, 
-            slot_mapping=slot_mapping[:bs * MQ_LEN], 
+            is_prefill=False,
+            slot_mapping=slot_mapping[:bs * MQ_LEN],
             context_lens=context_lens[:bs],
             block_tables=block_tables[:bs]
         )
@@ -491,16 +560,16 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         outputs[:bs * MQ_LEN] = model_runner.model(
             input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN])
         logits[:bs * MQ_LEN] = model_runner.model.compute_logits(outputs[:bs * MQ_LEN], False)
-        
+
         # Capture both model run and logits computation
         with torch.cuda.graph(graph, graph_pool):
             outputs[:bs * MQ_LEN] = model_runner.model(input_ids[:bs * MQ_LEN], positions[:bs * MQ_LEN])
             logits[:bs * MQ_LEN] = model_runner.model.compute_logits(outputs[:bs * MQ_LEN], False)
-        
+
         if graph_pool is None:
             graph_pool = graph.pool()
         graphs[bs] = graph
-        
+
         torch.cuda.synchronize()
         reset_context()
 
@@ -515,12 +584,3 @@ def capture_fi_tree_decode_cudagraph(model_runner):
     )
 
     return graph_vars, graph_pool, graphs, graph_bs_list
-
-'''
-[run_fi_tree_decode_cudagraph] step 0: setup=0.020ms, mask=0.396ms, buffer_prep=0.361ms, plan=0.647ms, replay=1.310ms, logits=0.272ms
-[run_fi_tree_decode_cudagraph] step 1: setup=0.021ms, mask=0.325ms, buffer_prep=0.313ms, plan=0.667ms, replay=1.315ms, logits=0.270ms
-[run_fi_tree_decode_cudagraph] step 2: setup=0.021ms, mask=0.294ms, buffer_prep=0.305ms, plan=0.642ms, replay=1.314ms, logits=0.276ms
-[run_fi_tree_decode_cudagraph] step 3: setup=0.017ms, mask=0.278ms, buffer_prep=0.342ms, plan=0.605ms, replay=1.322ms, logits=0.266ms
-[run_fi_tree_decode_cudagraph] step 4: setup=0.017ms, mask=0.296ms, buffer_prep=0.292ms, plan=0.630ms, replay=1.325ms, logits=0.263ms
-
-''' 

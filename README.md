@@ -24,15 +24,16 @@ python -c "from ssd import LLM; print('ok')"
 
 ## Quick Start
 
-To see a demo and benchmark, go to `cd bench/` directory and run: 
+To see a demo and benchmark, go to `cd bench/` directory and run:
 
-`python bench.py --size 8 --numseqs 4 --llama` (autoregressive, single-GPU by default)
+`python bench.py --size 8 --numseqs 4` (autoregressive Llama 8B, single GPU)
 
-`python bench.py --size 70 --gpus 4 --numseqs 4 --llama` (autoregressive, big model needs 4 GPUs)
+`python bench.py --size 70 --gpus 4 --numseqs 4` (autoregressive Llama 70B, 4 GPUs)
 
-`python bench.py --size 70 --draft 1 --gpus 4 --numseqs 4 --llama --spec --k 4` (sync spec, big model)
+`python bench.py --size 70 --draft 1 --gpus 4 --numseqs 4 --spec` (sync speculative, Llama 70B+1B)
 
-`python bench.py --size 70 --draft 1 --gpus 5 --numseqs 4 --llama --spec --async --k 4` (async spec, needs an extra GPU)
+`python bench.py --size 70 --draft 1 --gpus 5 --numseqs 4 --spec --async` (async speculative, needs extra GPU)
 
-See `bench/bench.py` for all hyperparams (Saguaro sampling, batch size, temperature, etc). 
+Llama is the default model family. Use `--qwen` for Qwen models (e.g. `--qwen --size 32 --draft 0.6`).
 
+See `bench/bench.py` for all hyperparams (k, f, batch size, temperature, fan-out lists, backup strategy, etc).

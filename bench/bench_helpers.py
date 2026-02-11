@@ -176,14 +176,7 @@ def load_dataset_token_ids(
                     break
                 data = json.loads(line.strip())
                 text: str = data["text"]
-                # tokens = tokenizer.encode(text, add_special_tokens=False)
-                
-                formatted = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": text}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                tokens = tokenizer.encode(formatted, add_special_tokens=False)
+                tokens = tokenizer.encode(text, add_special_tokens=False)
 
                 target_len = max(len(tokens), input_len)
                 
@@ -252,15 +245,7 @@ def generate_benchmark_inputs(
         selected_prompts = example_prompts[:num_prompts]
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        string_prompts = [
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            for prompt in selected_prompts
-        ]
+        string_prompts = selected_prompts
         return string_prompts, None, selected_prompts
 
     if getattr(args, "random", False):
