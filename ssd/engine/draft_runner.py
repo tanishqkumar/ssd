@@ -213,9 +213,9 @@ class DraftRunner(ModelRunner):
         # Draft model now returns full target vocab size logits (after d2t expansion)
         V = self.hf_config.vocab_size
 
-        # PERFORMANCE: torch.empty instead of torch.manual_seed(0)+torch.randn — avoids CUDA device sync + 1.2MB wasted alloc
-        out_logits = torch.empty((B, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
-        out_tokens = torch.empty((B, K), dtype=torch.int64, device=self.device)
+        # Init miss slots with valid random logits so token IDs are in-vocab (fixes B>1 crash)
+        out_logits = torch.empty((B, K, V), dtype=self.hf_config.torch_dtype, device=self.device).uniform_()
+        out_tokens = out_logits.argmax(dim=-1)
         cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache_and_respond: request_keys should be (B, 3), got {request_keys.shape}"
