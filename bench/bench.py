@@ -29,7 +29,7 @@ def parse_arguments():
     # Speculative decoding configuration
     parser.add_argument("--spec", action="store_true", help="Enable speculative decoding")
     parser.add_argument("--eagle", action="store_true", help="Enable eagle speculative decoding (implies --spec, uses default eagle draft for model)")
-    parser.add_argument("--k", type=int, default=1, help="Speculative decoding k value")
+    parser.add_argument("--k", type=int, default=6, help="Speculative decoding k value")
     parser.add_argument("--async", action="store_true", help="Enable async speculative decoding")
     parser.add_argument("--f", type=int, default=3, help="Async fan out value")
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
@@ -39,7 +39,7 @@ def parse_arguments():
     parser.add_argument("--ttemp", type=float, default=None, help="Target async temperature (overrides --temp for async verify)")
     parser.add_argument("--afn", dest="afn", action="store_true", help="Enable adaptive fan-out (skip top-1 for 0<k<K)")
     parser.set_defaults(afn=False) # warning: do not use `afn` it is deprecated 
-    parser.add_argument("--jit", action="store_true", help="Enable JIT speculative decoding")
+    parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
     
     # Memory and batching configuration
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
@@ -84,7 +84,7 @@ def create_run_name(args):
     """Create a descriptive run name for wandb logging."""
     spec_mode_str = "spec" if args.spec else "normal"
     async_mode_str = "_async" if getattr(args, 'async', False) else ""
-    jit_mode_str = "_jit" if args.jit else ""
+    jit_mode_str = "_jit" if args.backup == "jit" else ""
     model_type = "llama" if args.llama else "qwen"
     example_str = "_example" if args.example else ""
     humaneval_str = "_humaneval" if args.humaneval else ""
@@ -126,7 +126,7 @@ def initialize_wandb(args, run_name):
             "gpus": args.gpus,
             "speculative_decoding": args.spec,
             "async_speculative": getattr(args, 'async', False),
-            "jit_speculative": args.jit,
+            "jit_speculative": args.backup == "jit",
             "k": args.k if args.spec else None,
             "f": args.f,
             "fan_out_list": args.flh,
@@ -169,7 +169,7 @@ def create_llm_kwargs(args, draft_path):
         max_num_seqs=args.b,
         max_model_len=args.max_model_len,
         sampler_x=args.x,
-        jit_speculate=args.jit,
+        jit_speculate=(args.backup == "jit"),
     )
 
     # Pass fan out list if specified
@@ -323,7 +323,7 @@ def main():
         mode = "Eager" if args.eager else "CUDA Graphs"
         spec_mode = f" + Speculative(k={args.k})" if args.spec else ""
         async_mode = " + Async" if getattr(args, 'async', False) else ""
-        jit_mode = " + JIT" if args.jit else ""
+        jit_mode = " + JIT" if args.backup == "jit" else ""
         x_mode = f" + X({args.x})" if args.x else ""
         full_mode = mode + spec_mode + async_mode + jit_mode + x_mode
         
