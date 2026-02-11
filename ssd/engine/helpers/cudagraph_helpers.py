@@ -3,6 +3,7 @@ import torch
 from typing import List
 from ssd.utils.context import set_context, get_context, reset_context
 from ssd.engine.helpers.mask_helpers import get_custom_mask
+from flashinfer.quantization import get_quantization_module
 from time import perf_counter
 
 
@@ -23,19 +24,18 @@ def _compute_page_mask_indptr_cpu(qo_indptr, paged_kv_indptr, paged_kv_last_page
 # FlashInfer's segment_packbits calls indptr_new[-1].item() on a GPU tensor = sync point.
 # We compute indptr_new on CPU first, then transfer to GPU async.
 def _segment_packbits_no_sync(x_gpu, mask_indptr_cpu, bitorder="little"):
-    from flashinfer.quantization import get_quantization_module
     device = x_gpu.device
     indptr_cpu = mask_indptr_cpu.to(torch.int32)
     seglen = indptr_cpu[1:] - indptr_cpu[:-1]
     packed_len = (seglen + 7) // 8
     indptr_new_cpu = torch.zeros(len(indptr_cpu), dtype=torch.int32)
     indptr_new_cpu[1:] = torch.cumsum(packed_len, 0)
-    output_nnzs = int(indptr_new_cpu[-1].item())  # CPU .item() -- no GPU sync
+    output_nnzs = int(indptr_new_cpu[-1].item())
     indptr_gpu = indptr_cpu.to(device, non_blocking=True)
     indptr_new_gpu = indptr_new_cpu.to(device, non_blocking=True)
     y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
     get_quantization_module().segment_packbits(x_gpu, indptr_gpu, indptr_new_gpu, bitorder, y)
-    return y
+    return y, indptr_new_gpu
 
 
 ## RUN CUDAGRAPHS
@@ -43,38 +43,57 @@ def _segment_packbits_no_sync(x_gpu, mask_indptr_cpu, bitorder="little"):
 def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_vars):
     context = get_context()
     k_plus_1 = model_runner.config.speculate_k + 1
-    bs = input_ids.size(0) // k_plus_1  # bs = N here
+    orig_bs = input_ids.size(0) // k_plus_1  # orig_bs = N here
 
-    graph = model_runner.graphs["verify"][next(
-        x for x in model_runner.graph_bs_list["verify"] if x >= bs)]
+    wrapper_bs = next(
+        x for x in model_runner.graph_bs_list["verify"] if x >= orig_bs)
+    graph = model_runner.graphs["verify"][wrapper_bs]
 
     for k, v in graph_vars.items():
         if k != "outputs":
             v.zero_()
 
-    # Reshape 1D tensors to 2D before assignment
-    # Assert that slot_mapping contains unique values (no duplicates)
-    assert len(context.slot_mapping) == len(torch.unique(context.slot_mapping)), \
-        f"slot_mapping contains duplicate values: {context.slot_mapping}"
+    # Pad to graph bucket size if needed (fixes B>=6 crash from non-monotonic cu_seqlens_q)
+    if wrapper_bs > orig_bs:
+        pad_bs = wrapper_bs - orig_bs
+        pad_flat = pad_bs * k_plus_1
+        dev = input_ids.device
+
+        input_ids = torch.cat([input_ids, torch.zeros(pad_flat, dtype=input_ids.dtype, device=dev)])
+        positions = torch.cat([positions, torch.zeros(pad_flat, dtype=positions.dtype, device=dev)])
+        slot_mapping = torch.cat([
+            context.slot_mapping,
+            torch.full((pad_flat,), -1, dtype=context.slot_mapping.dtype, device=dev)])
+        # Repeat last real row for ghost sequences (valid page table / context len)
+        bt = context.block_tables
+        cl = context.context_lens
+        block_tables = torch.cat([bt, bt[orig_bs-1:orig_bs].expand(pad_bs, -1).contiguous()])
+        context_lens = torch.cat([cl, cl[orig_bs-1:orig_bs].expand(pad_bs).contiguous()])
+        bs = wrapper_bs
+    else:
+        slot_mapping = context.slot_mapping
+        block_tables = context.block_tables
+        context_lens = context.context_lens
+        bs = orig_bs
+
     graph_vars["input_ids"][:bs * k_plus_1] = input_ids
     graph_vars["positions"][:bs * k_plus_1] = positions
-    graph_vars["slot_mapping"][:bs * k_plus_1] = context.slot_mapping
-    graph_vars["context_lens"][:bs] = context.context_lens
-    # Construct cu_seqlens_q here instead of assuming it's set in context
+    graph_vars["slot_mapping"][:bs * k_plus_1] = slot_mapping
+    graph_vars["context_lens"][:bs] = context_lens
+    # Construct cu_seqlens_q for FULL padded batch (monotonically increasing)
     seqlen_q = torch.full(
         (bs,), k_plus_1, dtype=torch.int32, device=graph_vars["cu_seqlens_q"].device)
     cu = graph_vars["cu_seqlens_q"][:bs + 1]
     cu.zero_()
     cu[1:].copy_(torch.cumsum(seqlen_q, 0))
 
-    if context.block_tables is not None:
-        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+    if block_tables is not None:
+        graph_vars["block_tables"][:bs, :block_tables.size(1)] = block_tables
 
     graph.replay() # [1.35ms/1.85ms]
 
-    # Extract outputs for the actual batch size and reshape if needed
-    # [bs * (k+1), hidden_size]
-    outputs = graph_vars["outputs"][:bs * k_plus_1]
+    # Extract outputs for the ORIGINAL batch size only
+    outputs = graph_vars["outputs"][:orig_bs * k_plus_1]
     return model_runner.model.compute_logits(outputs, last_only)
 
 
@@ -236,33 +255,43 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         precompute_time = start_time.elapsed_time(end_time)
         start_time.record()
 
-    # PERFORMANCE: Sync-free plan -- CPU tensors for qo_indptr/kv_indptr/kv_last_page_len
-    # skip plan()'s .to("cpu") syncs. packed_custom_mask skips segment_packbits .item() sync.
-    # Allows CPU plan work to proceed while GPU replays the previous step's graph.
+    # Sync-free plan: call C++ plan directly, skip Python plan()'s 3 GPU syncs
     kv_indices = cache["precomputed_kv"][step]
     kv_indptr_cpu, kv_lpl_cpu = cache["plan_cpu_args"][step]
+    qo_indptr_cpu = cache["cu_seqlens_q_cpu"]
 
     custom_mask = get_custom_mask(
         model_runner.config, context_lens, step, K, F, B,
         device=model_runner.device, cache_hits=cache_hits)
     mask_indptr_cpu = _compute_page_mask_indptr_cpu(
-        cache["cu_seqlens_q_cpu"], kv_indptr_cpu, kv_lpl_cpu, model_runner.block_size)
-    packed_mask = _segment_packbits_no_sync(
+        qo_indptr_cpu, kv_indptr_cpu, kv_lpl_cpu, model_runner.block_size)
+    packed_mask, packed_indptr_gpu = _segment_packbits_no_sync(
         custom_mask.contiguous().view(-1), mask_indptr_cpu)
 
-    wrapper.plan(
-        cache["cu_seqlens_q_cpu"],
-        kv_indptr_cpu,
-        kv_indices,
-        kv_lpl_cpu,
-        model_runner.hf_config.num_attention_heads,
+    wrapper._custom_mask_buf[:len(packed_mask)].copy_(packed_mask, non_blocking=True)
+    wrapper._mask_indptr_buf.copy_(packed_indptr_gpu, non_blocking=True)
+    wrapper._qo_indptr_buf.copy_(qo_indptr_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
+    wrapper._paged_kv_indptr_buf.copy_(kv_indptr_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
+    wrapper._paged_kv_last_page_len_buf.copy_(kv_lpl_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
+    wrapper._paged_kv_indices_buf[:len(kv_indices)].copy_(kv_indices, non_blocking=True)
+
+    kv_lens_cpu = ((kv_indptr_cpu[1:] - kv_indptr_cpu[:-1] - 1) * model_runner.block_size + kv_lpl_cpu).to(torch.int32)
+    total_num_rows = int(qo_indptr_cpu[-1].item())
+    wrapper._kv_lens_buffer[:len(kv_lens_cpu)].copy_(kv_lens_cpu, non_blocking=True)
+    plan_args = [
+        wrapper._float_workspace_buffer, wrapper._int_workspace_buffer,
+        wrapper._pin_memory_int_workspace_buffer,
+        qo_indptr_cpu, kv_indptr_cpu, kv_lens_cpu,
+        wrapper._max_total_num_rows or total_num_rows,
+        B, model_runner.hf_config.num_attention_heads,
         model_runner.hf_config.num_key_value_heads,
-        model_runner.hf_config.head_dim,
-        model_runner.block_size,
-        packed_custom_mask=packed_mask,
-        q_data_type=torch.bfloat16,
-        kv_data_type=torch.bfloat16,
-    )
+        model_runner.block_size, wrapper.is_cuda_graph_enabled,
+        model_runner.hf_config.head_dim, model_runner.hf_config.head_dim,
+        False, -1,
+    ]
+    if wrapper._backend == "fa2":
+        plan_args.extend([-1, False])
+    wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
 
     if PROFILE:
         end_time.record()
