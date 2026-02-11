@@ -34,6 +34,7 @@ METRICS = {
     "prefill_total_tokens": 0,
     "decode_total_tokens": 0,
     "target_step_times": [],
+    "target_verify_times": [],
 }
 
 
@@ -225,8 +226,16 @@ class LLMEngine:
             print(f"{'='*80}\n", flush=True)
 
         # hit draft tree cache via handshake API, this bounds them
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        if _prof:
+            torch.cuda.synchronize()
+            _hs0 = perf_counter()
         cache_hits, speculations_tokens, logits_q = self.target_draft_handshake(
             seqs_copy)
+        if _prof:
+            torch.cuda.synchronize()
+            _hs1 = perf_counter()
+            print(f"[PROFILE target] handshake_detail={(_hs1-_hs0)*1000:.2f}ms", flush=True)
 
         # The first column of the final speculation tensor is the recovery tokens
         recovery_tokens_tensor = torch.tensor(
@@ -298,10 +307,19 @@ class LLMEngine:
 
     def verify(self, seqs_copy: list[Sequence], speculations: torch.Tensor, logits_q: torch.Tensor, cache_hits: torch.Tensor | None = None):
         """Verify speculative tokens using the target model."""
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         batch_size = len(seqs_copy)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _vt0 = perf_counter()
 
         result = self.model_runner.call(
             "run", seqs_copy, False, False, True)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _vt1 = perf_counter()
         
         if self.config.use_eagle:
             logits_p_flat, eagle_acts_flat = result
@@ -370,10 +388,22 @@ class LLMEngine:
             cache_hits=cache_hits,
         )
 
-        if __debug__:
-            for i, new_suffix in enumerate(new_suffixes):
-                decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
-                print(f"[LLMEngine.verify] verification {i}: {decoded_tokens}", flush=True)
+        if _prof:
+            torch.cuda.synchronize()
+            _vt2 = perf_counter()
+            print(f"[PROFILE verify] target_fwd={(_vt1-_vt0)*1000:.2f}ms verify_compute={(_vt2-_vt1)*1000:.2f}ms", flush=True)
+
+        # Debug: print recovery tokens detokenized
+        if __debug__ and recovery_tokens is not None and len(recovery_tokens) > 0:
+            tokenizer = self.tokenizer
+            recovery_texts = []
+            for token in recovery_tokens:
+                try:
+                    text = tokenizer.decode([token], skip_special_tokens=False)
+                    recovery_texts.append(text)
+                except Exception:
+                    recovery_texts.append(f"<token_id:{token}>")
+            print(f"[verify] recovery tokens: {recovery_texts}", flush=True)
         
         METRICS["accepted_suffix_lens_with_recovery"].extend(
             [len(s) for s in new_suffixes]) 
@@ -488,35 +518,37 @@ class LLMEngine:
             dist.send(eagle_acts, dst=self.num_tp_gpus, group=self.model_runner.async_pg)
 
     def spec_prefill(self, seqs: list[Sequence]):
-        # Always target prefill first
-        print(f'[spec_prefill] target prefill', flush=True)
-        result = self.model_runner.call("run", seqs, True)
         if self.config.use_eagle:
+            # Eagle path: target first (need eagle_acts from target)
+            print(f'[spec_prefill] eagle path: target prefill first', flush=True)
+            result = self.model_runner.call("run", seqs, True)
             assert isinstance(result, tuple), "result must be a tuple when use_eagle is True"
             assert self.config.draft_async, "Eagle requires async to be true..."
             token_ids, eagle_acts = result
-            print(f'[spec_prefill] target prefill with eagle, got TUPLE result about to fire and forget draft prefill', flush=True)
+            print(f'[spec_prefill] eagle: got acts, firing draft prefill', flush=True)
             
             offset = 0
             for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
                 seq.recovery_token_id = token_id
                 seq_len = seq.num_prompt_tokens
-                # this doesn't move acts onto cpu does it? 
                 seq.last_target_hidden_state = eagle_acts[offset + seq_len - 1].clone()
                 offset += seq_len
             
             self.async_draft_prefill_remote(seqs, eagle_acts)
         else:
-            token_ids = result
-            for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
-                seq.recovery_token_id = token_id
-            
-            # Only call async_draft_prefill_remote for async spec
+            # Non-eagle path: draft first (enables pipeline overlap)
+            print(f'[spec_prefill] non-eagle: draft prefill first', flush=True)
             if self.config.draft_async:
                 self.async_draft_prefill_remote(seqs, None)
             else:
-                # Sync spec: prefill draft model locally (ignore sampled tokens, just building KV cache)
                 self.draft_runner.call("run", seqs, True)
+            
+            # Then target prefill
+            print(f'[spec_prefill] target prefill', flush=True)
+            result = self.model_runner.call("run", seqs, True)
+            token_ids = result
+            for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
+                seq.recovery_token_id = token_id
 
         # recovery token will be first token in next fwd, but not yet in kvc of either model
         for i, (seq, token_id) in enumerate(zip(seqs, token_ids)):
@@ -544,16 +576,30 @@ class LLMEngine:
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
 
     def async_spec_step(self, seqs: list[Sequence]):
+        _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        if _prof:
+            torch.cuda.synchronize()
+            _t0 = perf_counter()
+
         # fire a spec request to hit cache using self.cache_keys, get immediate turnaround
         seqs_copy, speculations, logits_q, cache_hits = self.speculate_async(
             seqs)
 
+        if _prof:
+            torch.cuda.synchronize()
+            _t1 = perf_counter()
+
+        _tv0 = perf_counter()
         verify_result = self.verify(
             seqs_copy, speculations, logits_q, cache_hits=cache_hits)
-        
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t2 = perf_counter()
+
         if self.config.use_eagle:
             new_suffixes, recovery_tokens, eagle_acts = verify_result
-            
+
             for i, seq in enumerate(seqs):
                 accepted_len = len(new_suffixes[i])
                 idx = min(accepted_len - 1, eagle_acts.shape[1] - 1)
@@ -562,7 +608,13 @@ class LLMEngine:
             new_suffixes, recovery_tokens = verify_result
 
         self.postprocess_speculate(seqs, new_suffixes, recovery_tokens)
-        
+        METRICS["target_verify_times"].append(perf_counter() - _tv0)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _t3 = perf_counter()
+            print(f"[PROFILE target] handshake={(_t1-_t0)*1000:.2f}ms verify={(_t2-_t1)*1000:.2f}ms postprocess={(_t3-_t2)*1000:.2f}ms total={(_t3-_t0)*1000:.2f}ms hits={cache_hits.sum().item()}/{len(cache_hits)} toks={sum(len(s) for s in new_suffixes)}", flush=True)
+
         return sum(len(s) for s in new_suffixes)
 
     def step(self):
@@ -618,6 +670,9 @@ class LLMEngine:
                 f"[metrics] Avg Fraction of Speculated Tokens Accepted: {avg_acceptance_rate:.2f}", flush=True)
             print(
                 f"[metrics] Avg target time per full step (ms): {sum(METRICS['target_step_times']) * 1000 / len(METRICS['target_step_times']):.2f}", flush=True)
+            if METRICS['target_verify_times']:
+                print(
+                    f"[metrics] Avg target verify time (ms): {sum(METRICS['target_verify_times']) * 1000 / len(METRICS['target_verify_times']):.2f}", flush=True)
             if self.config.draft_async:
                 print(
                     f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
