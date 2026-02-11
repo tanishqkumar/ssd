@@ -132,7 +132,7 @@ The final answer is: $9.96<|eot_id|><|start_header_id|>
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -146,7 +146,7 @@ python -O bench/bench.py --llama --size 70 --gpus 4 --b 1 --numseqs 8 --output_l
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 4 --spec --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 4 --spec --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -161,7 +161,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 4 --spec --k 6 --f 3
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 128 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 128 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -173,7 +173,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -185,7 +185,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 2 --backup jit --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 2 --backup jit --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -197,7 +197,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 4 --backup jit --numseqs 16 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 4 --backup jit --numseqs 16 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -209,7 +209,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 8 --backup jit --numseqs 32 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 8 --backup jit --numseqs 32 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -221,7 +221,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 16 --backup jit --numseqs 64 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 16 --backup jit --numseqs 64 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -233,7 +233,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 1 --b 16 --backup jit --numseqs 64 --output_len 512 --temp 0 --flh 1 1 1 1 1 1 1 --flm 4 2 1 0 0 0 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 1 --b 16 --backup jit --numseqs 64 --output_len 512 --temp 0 --flh 1 1 1 1 1 1 1 --flm 4 2 1 0 0 0 0
 ```
 
 | Metric | Value |
@@ -255,7 +255,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0.7
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0.7
 ```
 
 | Metric | Value |
@@ -272,7 +272,7 @@ Prompt 2: Correctly computes $10.00 earnings.
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.0
 ```
 
 | Metric | Value |
@@ -288,7 +288,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --size 32 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --qwen --size 32 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -299,7 +299,7 @@ python -O bench/bench.py --size 32 --gpus 4 --b 1 --numseqs 8 --output_len 512 -
 
 **Command:**
 ```
-python -O bench/bench.py --size 32 --draft 0.6 --gpus 4 --spec --k 4 --f 2 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --qwen --size 32 --draft 0.6 --gpus 4 --spec --k 4 --f 2 --b 1 --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -310,7 +310,7 @@ python -O bench/bench.py --size 32 --draft 0.6 --gpus 4 --spec --k 4 --f 2 --b 1
 
 **Command:**
 ```
-python -O bench/bench.py --size 32 --draft 0.6 --gpus 5 --spec --async --k 4 --f 2 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --qwen --size 32 --draft 0.6 --gpus 5 --spec --async --k 4 --f 2 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -328,7 +328,7 @@ python -O bench/bench.py --size 32 --draft 0.6 --gpus 5 --spec --async --k 4 --f
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup fast --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup fast --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -340,7 +340,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0 --eager
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0 --eager
 ```
 
 | Metric | Value |
@@ -352,7 +352,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
 ```
 
 | Metric | Value |
@@ -364,7 +364,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.05
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.05
 ```
 
 | Metric | Value |
@@ -376,7 +376,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.25
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.25
 ```
 
 | Metric | Value |
@@ -388,7 +388,7 @@ python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k
 
 **Command:**
 ```
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
 ```
 
 | Metric | Value |

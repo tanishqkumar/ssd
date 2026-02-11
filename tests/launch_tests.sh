@@ -16,25 +16,6 @@ echo "Output dir: $OUTDIR"
 BENCH="python -O bench/bench.py"
 
 # ============================================================
-# Job 0: Unified mask unit test (fast)
-# ============================================================
-cat > "${OUTDIR}/job0_unittest.sh" << 'JOBEOF'
-#!/bin/bash
-#SBATCH --exclusive
-#SBATCH --cpus-per-task=22
-#SBATCH --gres=gpu:6
-#SBATCH --time=00:05:00
-cd /home/tkumar/ssd
-export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
-export PYTHONPATH=/home/tkumar/ssd
-source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate ssd
-echo "Node: $(hostname), Job: $SLURM_JOBID"
-echo '=== UNIT TEST: unified mask correctness ==='
-python /home/tkumar/ssd/test_unified_mask.py
-JOBEOF
-
-# ============================================================
 # Job 1: Llama 70B AR + Sync Spec (4 GPUs)
 # ============================================================
 cat > "${OUTDIR}/job1_ar_sync.sh" << 'JOBEOF'
@@ -50,9 +31,9 @@ source /home/tkumar/miniconda3/etc/profile.d/conda.sh
 conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B AR temp=0 ==='
-python -O bench/bench.py --llama --size 70 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
 echo '=== Llama 70B Sync Spec K=6 f=3 temp=0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 4 --spec --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 4 --spec --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0
 JOBEOF
 
 # ============================================================
@@ -71,9 +52,9 @@ source /home/tkumar/miniconda3/etc/profile.d/conda.sh
 conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=1 ns=8 temp=0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --jit --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
 echo '=== Llama 70B Async K=6 f=3 B=1 ns=128 temp=0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --jit --numseqs 128 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 128 --output_len 512 --temp 0
 JOBEOF
 
 # ============================================================
@@ -92,11 +73,11 @@ source /home/tkumar/miniconda3/etc/profile.d/conda.sh
 conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=2 temp=0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 2 --jit --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 2 --backup jit --numseqs 8 --output_len 512 --temp 0
 echo '=== Llama 70B Async K=6 f=3 B=4 temp=0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 4 --jit --numseqs 16 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 4 --backup jit --numseqs 16 --output_len 512 --temp 0
 echo '=== Llama 70B Async K=6 f=3 B=8 temp=0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 8 --jit --numseqs 32 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 8 --backup jit --numseqs 32 --output_len 512 --temp 0
 JOBEOF
 
 # ============================================================
@@ -115,7 +96,7 @@ source /home/tkumar/miniconda3/etc/profile.d/conda.sh
 conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=16 temp=0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 16 --jit --numseqs 64 --output_len 512 --temp 0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 16 --backup jit --numseqs 64 --output_len 512 --temp 0
 JOBEOF
 
 # ============================================================
@@ -134,9 +115,9 @@ source /home/tkumar/miniconda3/etc/profile.d/conda.sh
 conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=1 temp=0.7 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --jit --numseqs 8 --output_len 512 --temp 0.7
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0.7
 echo '=== Llama 70B Async K=6 f=3 B=1 temp=1.0 ==='
-python -O bench/bench.py --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --jit --numseqs 8 --output_len 512 --temp 1.0
+python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.0
 JOBEOF
 
 # ============================================================
@@ -156,7 +137,7 @@ conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 
 BENCH="python -O bench/bench.py"
-BASE="--llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0"
+BASE="--size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --numseqs 8 --output_len 512 --temp 0"
 
 echo '=== Llama 70B Async K=6 f=3 NO-JIT temp=0 ==='
 $BENCH $BASE
@@ -165,22 +146,22 @@ echo '=== Llama 70B Async K=6 f=3 EAGER temp=0 ==='
 $BENCH $BASE --eager
 
 echo '=== Llama 70B Async K=6 f=3 JIT temp=0 ==='
-$BENCH $BASE --jit
+$BENCH $BASE --backup jit
 
 echo '=== Llama 70B Async K=6 f=3 JIT temp=1.3 x=0.05 ==='
-$BENCH --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.05
+$BENCH --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.05
 
 echo '=== Llama 70B Async K=6 f=3 JIT temp=1.3 x=0.25 ==='
-$BENCH --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.25
+$BENCH --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 1.3 --x 0.25
 
 echo '=== Llama 70B Async K=6 f=3 JIT temp=0 custom-FOL ==='
-$BENCH --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --jit --numseqs 8 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
+$BENCH --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
 
 echo '=== Llama 70B Async K=6 f=3 B=4 nonunif temp=0 ==='
-$BENCH --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 4 --jit --numseqs 16 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
+$BENCH --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 4 --backup jit --numseqs 16 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
 
 echo '=== Llama 70B Async K=6 f=3 B=16 nonunif temp=0 ==='
-$BENCH --llama --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 16 --jit --numseqs 64 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
+$BENCH --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 16 --backup jit --numseqs 64 --output_len 512 --temp 0 --flh 3 3 3 3 3 3 3 --flm 15 5 1 0 0 0 0
 
 echo '=== ALL DONE ==='
 JOBEOF
@@ -201,11 +182,11 @@ source /home/tkumar/miniconda3/etc/profile.d/conda.sh
 conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Qwen 32B AR temp=0 ==='
-python -O bench/bench.py --size 32 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --qwen --size 32 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
 echo '=== Qwen 32B Sync Spec K=4 f=2 temp=0 ==='
-python -O bench/bench.py --size 32 --draft 0.6 --gpus 4 --spec --k 4 --f 2 --b 1 --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --qwen --size 32 --draft 0.6 --gpus 4 --spec --k 4 --f 2 --b 1 --numseqs 8 --output_len 512 --temp 0
 echo '=== Qwen 32B Async Spec K=4 f=2 temp=0 ==='
-python -O bench/bench.py --size 32 --draft 0.6 --gpus 5 --spec --async --k 4 --f 2 --b 1 --jit --numseqs 8 --output_len 512 --temp 0
+python -O bench/bench.py --qwen --size 32 --draft 0.6 --gpus 5 --spec --async --k 4 --f 2 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
 JOBEOF
 
 # ============================================================

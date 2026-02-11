@@ -18,7 +18,8 @@ def parse_arguments():
     # Model configuration
     parser.add_argument("--size", type=str, choices=["0.6", "1.7", "4", "8", "14", "32", "1", "3", "70"], default="4", 
                         help="Model size in billions of parameters (0.6, 1.7, 4, 8, 14, 32, 1, 3, 70)")
-    parser.add_argument("--llama", action="store_true", help="Use Llama models instead of Qwen")
+    parser.add_argument("--llama", action="store_true", default=True, help="Use Llama models (default)")
+    parser.add_argument("--qwen", action="store_true", help="Use Qwen models instead of Llama")
     parser.add_argument("--draft", type=str, default=None, 
                         help="Draft model size (0.6 for Qwen-0.6B, 1 for Llama-1B) or path to draft model")
     
@@ -69,8 +70,10 @@ def parse_arguments():
     parser.add_argument("--group", type=str, default=None, help="Wandb group name")
     parser.add_argument("--name", type=str, default=None, help="Wandb run name")
     
-    # Handle eagle implication
     args = parser.parse_args()
+    assert not (args.qwen and '--llama' in sys.argv), "--llama and --qwen are mutually exclusive"
+    if args.qwen:
+        args.llama = False
     if args.eagle:
         args.spec = True
         assert args.llama, "Eagle currently only supports llama models"
