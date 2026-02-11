@@ -217,7 +217,6 @@ notebooks/
 plots/ 
 profile/  
 summaries/
-tests/ 
 vllm-env/ 
 *wandb* 
 wandb_runs/
