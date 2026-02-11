@@ -40,7 +40,7 @@ class SpeculatorAsync(SpeculatorBase):
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
-        skip_first = 1 if eagle_acts else 0
+        skip_first = 1 if eagle_acts is not None else 0
 
         # 1) build all the prefill payload in one shot
         input_ids, positions, cu_q, cu_k, max_q, max_k, slot_map = \
@@ -90,7 +90,7 @@ class SpeculatorAsync(SpeculatorBase):
             dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
         
         # 6) send eagle_acts if use_eagle
-        if eagle_acts:
+        if eagle_acts is not None:
             dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
 
         return SpeculateResult([], [])
