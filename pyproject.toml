@@ -23,6 +23,8 @@ dependencies = [
     "sgl-kernel==0.3.17.post1",
     "nvidia-cutlass-dsl==4.2.1",
     "wandb==0.22.0",
+    "hf_transfer",
+    "tiktoken",
 ]
 
 [project.urls]
