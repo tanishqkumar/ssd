@@ -36,8 +36,6 @@ def parse_arguments():
     parser.add_argument("--fl", type=int, nargs='+', default=None, help="Fan out list (e.g., --fl 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
-    parser.add_argument("--dtemp", type=float, default=None, help="Draft async temperature (overrides --temp for async tree decode)")
-    parser.add_argument("--ttemp", type=float, default=None, help="Target async temperature (overrides --temp for async verify)")
     parser.add_argument("--afn", dest="afn", action="store_true", help="Enable adaptive fan-out (skip top-1 for 0<k<K)")
     parser.set_defaults(afn=False) # warning: do not use `afn` it is deprecated 
     parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
@@ -52,6 +50,7 @@ def parse_arguments():
     parser.add_argument("--output_len", type=int, default=512, help="Maximum output length")
     parser.add_argument("--numseqs", type=int, default=128, help="Number of sequences to generate")
     parser.add_argument("--temp", type=float, default=0.0, help="Temperature for generation")
+    parser.add_argument("--dtemp", type=float, default=None, help="Draft async temperature (overrides --temp)")
     parser.add_argument("--x", type=float, default=None, help="Sampler x for generation (Saguaro sampling coefficient)")
     
     # Example mode
@@ -66,6 +65,7 @@ def parse_arguments():
     # Debugging and logging
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (saves draft inputs during prefill)")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum number of steps to run")
     parser.add_argument("--wandb", action="store_true", help="Log metrics to wandb")
     parser.add_argument("--group", type=str, default=None, help="Wandb group name")
     parser.add_argument("--name", type=str, default=None, help="Wandb run name")
@@ -80,7 +80,6 @@ def parse_arguments():
         assert args.temp == 0.0 and args.dtemp is None and args.ttemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
     return args
-
 
 
 def create_run_name(args):
@@ -101,17 +100,14 @@ def create_run_name(args):
     
     # Include all parameters that might be swept
     temp_str = f"_temp{args.temp}"
-    if getattr(args, 'async', False):
-        if args.dtemp is not None:
-            temp_str += f"_dtemp{args.dtemp}"
-        if args.ttemp is not None:
-            temp_str += f"_ttemp{args.ttemp}"
-    
+    if args.dtemp is not None:
+        temp_str += f"_dtemp{args.dtemp}"
+
     # Include all parameters from exec_bench.sh that could be swept
     draft_str = f"_draft{args.draft}" if args.draft is not None else "_nodraft"
     k_str = f"_k{args.k}"
     f_str = f"_f{args.f}"
-    
+
     return args.name if args.name else f"{model_type}_size{args.size}_{spec_mode_str}{async_mode_str}{jit_mode_str}_b{args.b}{k_str}{f_str}{draft_str}{temp_str}{sampler_x_str}{example_str}{humaneval_str}{alpaca_str}{c4_str}{ultrafeedback_str}{random_str}{all_str}{gsm_str}"
 
 
@@ -139,7 +135,6 @@ def initialize_wandb(args, run_name):
             "input_len": args.input_len,
             "output_len": args.output_len,
             "numseqs": args.numseqs,
-            "temperature": args.temp,
             "draft_model": args.draft,
             "b": args.b,
             "block_size": args.block_sz,
@@ -153,6 +148,7 @@ def initialize_wandb(args, run_name):
             "all_mode": args.all,
             "sampler_x": args.x,
             "implementation": "ssd",
+            "max_steps": args.max_steps,
         }
     )
 
@@ -173,6 +169,7 @@ def create_llm_kwargs(args, draft_path):
         max_model_len=args.max_model_len,
         sampler_x=args.x,
         jit_speculate=(args.backup == "jit"),
+        max_steps=args.max_steps,
     )
 
     # Pass fan out list if specified
@@ -181,17 +178,7 @@ def create_llm_kwargs(args, draft_path):
     if args.flm is not None:
         llm_kwargs["fan_out_list_miss"] = args.flm
 
-    # Pass decoupled async temps when specified
-    if getattr(args, 'async', False):
-        if args.dtemp is not None:
-            llm_kwargs["draft_async_temp"] = args.dtemp
-        if args.ttemp is not None:
-            llm_kwargs["target_async_temp"] = args.ttemp
-
     return llm_kwargs
-
-
-    # removed: helpers moved to bench_helpers
 
 
 def log_wandb_metrics(args, metrics, total_tokens, total_time, throughput, model_name, mode, run_name):
@@ -282,12 +269,11 @@ def main():
         num_reqs = args.numseqs
     sampling_params = [SamplingParams(
         temperature=args.temp,
+        draft_temperature=args.dtemp,
         ignore_eos=True,
         max_new_tokens=args.output_len,
-        draft_async_temperature=(args.dtemp if getattr(args, 'async', False) and args.dtemp is not None else None),
-        target_async_temperature=(args.ttemp if getattr(args, 'async', False) and args.ttemp is not None else None),
     ) for _ in range(num_reqs)]
-    
+
     # Print number of tokens in each input
     if prompts:
         for i, prompt in enumerate(prompts):

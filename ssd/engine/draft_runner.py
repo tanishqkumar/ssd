@@ -364,7 +364,7 @@ class DraftRunner(ModelRunner):
             temperatures, 
             draft_block_tables,
             target_recovery_activations
-            )
+        )
 
         # Print cache response details
         if self.config.verbose:
@@ -801,4 +801,3 @@ class DraftRunner(ModelRunner):
 
             else:
                 raise RuntimeError(f"draft_loop: unknown command {cmd}")
-
