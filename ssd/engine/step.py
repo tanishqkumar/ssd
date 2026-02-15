@@ -99,10 +99,13 @@ class SpecDecodeStep(InferenceStep):
 
         seqs_orig = seqs
         seqs_copy = [seq.clone_spec() for seq in seqs_orig]
+        # For Eagle, we signal eagle mode so the handshake sends target activations.
+        # The actual activations are stored in seq.last_target_hidden_state (set by postprocess_speculate).
+        eagle_sentinel = True if self.eagle else None
         in_verify_result = VerifyResult(
             new_suffixes=[],
             recovery_tokens=[],
-            eagle_acts=None,  # TODO: pass target activations here when we fix Eagle implementation.
+            eagle_acts=eagle_sentinel,
         )
         #### STEP 1: SPECULATE ####
         speculate_result = self.speculator.speculate(seqs_copy, in_verify_result)
