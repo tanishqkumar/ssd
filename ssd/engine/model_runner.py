@@ -449,7 +449,7 @@ class ModelRunner:
     def allocate_kv_cache(self):
         print(f'inside allocate_kv_cache -- ', flush=True)
         config = self.config
-        hf_config = config.hf_config 
+        hf_config = self.hf_config
         
         # Simplify: just look at free memory on the GPU, and allocate up to gpu_memory_utilization * free.
         free, _ = torch.cuda.mem_get_info()
