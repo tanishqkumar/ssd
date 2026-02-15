@@ -19,11 +19,12 @@ class DraftRunner(ModelRunner):
     def create_draft_config(cls, cfg: Config) -> Config:
         """Create a draft config from the main config without instantiating DraftRunner."""
         draft_cfg = dataclasses.replace(
-            cfg, 
-            model=cfg.draft, 
+            cfg,
+            model=cfg.draft,
             gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
             tokenizer_path=cfg.model if cfg.use_eagle else None,
             d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
+            enforce_eager=True if cfg.use_eagle else cfg.enforce_eager,
         )
         return draft_cfg
 
@@ -85,12 +86,10 @@ class DraftRunner(ModelRunner):
         # 4) receive eagle_acts if use_eagle
         eagle_acts = None
         if self.config.use_eagle:
-            eagle_acts = torch.empty(total_new_tokens, 3 * self.config.d_model_target, 
-                                     dtype=torch.float16, device=self.device)
+            eagle_acts = torch.empty(total_new_tokens, 3 * self.config.d_model_target,
+                                     dtype=self.hf_config.torch_dtype, device=self.device)
             dist.recv(eagle_acts, src=0, group=self.async_pg)
             assert eagle_acts is not None, "Draft must receive eagle_acts when use_eagle is True"
-            print(f'[draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, total_slots={total_slots}, max_q={max_q}, max_k={max_k}, batch_size={batch_size}', flush=True)
-            print(f'[draft_async_prefill] eagle_acts.shape={eagle_acts.shape}, input_ids.shape={input_ids.shape}', flush=True)
 
         # 5) set up context exactly like prepare_prefill() does:
         set_context(is_prefill=True, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max_q, max_seqlen_k=max_k,
@@ -98,29 +97,9 @@ class DraftRunner(ModelRunner):
 
         # 6) run the draft model in prefill mode
         if self.config.use_eagle:
-            num_last = 3  # Number of last positions to show
-            logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=bool(num_last == 1), hidden_states=eagle_acts)
-            
-            # Debug logging: show draft predictions after prefill
-            print(f'[draft_async_prefill] DRAFT PREFILL DONE', flush=True)
-            print(f'[draft_async_prefill] Draft predictions after prefill:', flush=True)
-            
-            # Get top-5 logits for each sequence
-            # Get the last 3 token positions for each sequence
-            num_positions = min(num_last, logits.shape[0])
-            start_idx = max(0, logits.shape[0] - num_positions)
-            
-            for i in range(start_idx, logits.shape[0]):
-                top5_logits, top5_indices = logits[i].topk(5, dim=-1)  # [5]
-                top5_tokens = top5_indices.tolist()
-                top5_values = top5_logits.tolist()
-                top5_texts = [self.tokenizer.decode([tok]) for tok in top5_tokens]
-                print(f'  Position {i} (last {logits.shape[0] - i}) top-5:', flush=True)
-                for rank, (tok_id, tok_val, tok_text) in enumerate(zip(top5_tokens, top5_values, top5_texts)):
-                    print(f'    {rank+1}. token_id={tok_id}, logit={tok_val:.3f}, text={repr(tok_text)}', flush=True)
+            logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=False, hidden_states=eagle_acts)
         else:
             self.run_model(input_ids, positions, is_prefill=True, last_only=True, hidden_states=eagle_acts)
-            print(f'[draft_async_prefill] DRAFT PREFILL DONE', flush=True)
 
         # 7) clean up
         reset_context()
@@ -327,7 +306,7 @@ class DraftRunner(ModelRunner):
         off += 3 * B
         seq_ids = cache_keys[:, 0]
         num_tokens = fused_req[off:off + B].to(torch.int64)
-        
+
         off += B
         draft_block_tables = fused_req[off:off + B *
                                        max_blocks].view(B, max_blocks).to(torch.int32)
@@ -339,7 +318,7 @@ class DraftRunner(ModelRunner):
             B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
 
-        if self.config.use_eagle: 
+        if self.config.use_eagle:
             dist.recv(target_recovery_activations, src=0, group=self.async_pg)
             
             # Print cache request details
@@ -746,7 +725,6 @@ class DraftRunner(ModelRunner):
 
             # PREFILL: run the draft prefill and then loop back
             if cmd == 1:
-                print(f'[draft] PREFILL command received on draft', flush=True)
                 self.draft_async_prefill()
                 continue
 
@@ -795,7 +773,6 @@ class DraftRunner(ModelRunner):
                 if self._draft_step_times:
                     avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
                     print(f"[metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
-                print(f'[draft] EXIT command received', flush=True)
                 self.exit()
                 break
 

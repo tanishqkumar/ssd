@@ -58,6 +58,10 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
             if args.size == "8":
                 return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B")
             elif args.size == "70":
+                # Use SpecForge draft (correct rope_theta=500k, same hidden_size as target)
+                specforge_path = "/data/tkumar/huggingface/hub/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge"
+                if os.path.isdir(specforge_path):
+                    return specforge_path
                 return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.3-Instruct-70B")
             else:
                 raise ValueError(f"EAGLE draft not available for Llama size {args.size}")
@@ -151,6 +155,7 @@ def load_dataset_token_ids(
     model_path: str,
     num_prompts: int,
     input_len: int,
+    use_chat_template: bool = False,
 ) -> Optional[List[List[int]]]:
     """Load and tokenize dataset prompts to token ids, padding/truncating to target length.
 
@@ -176,10 +181,16 @@ def load_dataset_token_ids(
                     break
                 data = json.loads(line.strip())
                 text: str = data["text"]
-                tokens = tokenizer.encode(text, add_special_tokens=False)
+                if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
+                    tokens = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": text}],
+                        add_generation_prompt=True,
+                    )
+                else:
+                    tokens = tokenizer.encode(text, add_special_tokens=False)
 
                 target_len = max(len(tokens), input_len)
-                
+
                 if len(tokens) >= target_len:
                     truncated_tokens = tokens[:target_len]
                 else:
@@ -196,6 +207,7 @@ def load_all_dataset_token_ids(
     model_path: str,
     num_prompts_per_dataset: int,
     input_len: int,
+    use_chat_template: bool = False,
 ) -> List[List[int]]:
     """Load tokenized prompts from a union of datasets, falling back to random when needed."""
     datasets = ["humaneval", "alpaca", "gsm", "ultrafeedback"]
@@ -205,7 +217,8 @@ def load_all_dataset_token_ids(
         print(
             f"Loading {num_prompts_per_dataset} prompts from {dataset_name}...")
         dataset_prompts = load_dataset_token_ids(
-            dataset_name, model_path, num_prompts_per_dataset, input_len)
+            dataset_name, model_path, num_prompts_per_dataset, input_len,
+            use_chat_template=use_chat_template)
         if dataset_prompts is not None:
             all_prompts.extend(dataset_prompts)
         else:
@@ -253,9 +266,12 @@ def generate_benchmark_inputs(
             args.input_len)] for _ in range(args.numseqs)]
         return None, prompt_token_ids, None
 
+    use_chat_template = getattr(args, "chat_template", False)
+
     if getattr(args, "all", False):
         token_ids = load_all_dataset_token_ids(
-            model_path, args.numseqs, args.input_len)
+            model_path, args.numseqs, args.input_len,
+            use_chat_template=use_chat_template)
         if not token_ids:
             print("Warning: All dataset loading failed, falling back to random tokens")
             token_ids = [[randint(0, 10000) for _ in range(
@@ -275,7 +291,8 @@ def generate_benchmark_inputs(
         dataset_name = "gsm"
 
     dataset_prompts = load_dataset_token_ids(
-        dataset_name, model_path, args.numseqs, args.input_len)
+        dataset_name, model_path, args.numseqs, args.input_len,
+        use_chat_template=use_chat_template)
     if dataset_prompts is None:
         token_ids = [[randint(0, 10000) for _ in range(args.input_len)]
                      for _ in range(args.numseqs)]
