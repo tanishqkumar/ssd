@@ -89,7 +89,7 @@ class TargetDraftHandshake:
         # Send spec request command
         cmd = torch.tensor([0], dtype=torch.int64, device=self.device)  # 0 for spec
         dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
-        
+
         # Send metadata (B, K, F)
         meta = torch.tensor([self.B, self.K, self.F], dtype=torch.int64, device=self.device)
         dist.send(meta, dst=self.draft_runner_rank, group=self.async_pg)
@@ -104,10 +104,11 @@ class TargetDraftHandshake:
             self.draft_block_tables.to(torch.int64),
         )
         dist.send(self.temperatures, dst=self.draft_runner_rank, group=self.async_pg)
-        
+
         if self.recovery_activations is not None:
-            dist.send(self.recovery_activations, dst=self.draft_runner_rank, group=self.async_pg)
-    
+            # Cast to draft dtype to match draft receive buffer
+            dist.send(self.recovery_activations.to(self.draft_dtype), dst=self.draft_runner_rank, group=self.async_pg)
+
     def receive_response(self):
         """Receive the response: cache hits, speculations, and logits.
         

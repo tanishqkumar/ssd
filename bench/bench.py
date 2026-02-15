@@ -61,7 +61,8 @@ def parse_arguments():
     parser.add_argument("--ultrafeedback", action="store_true", help="Use UltraFeedback prompts")
     parser.add_argument("--random", action="store_true", help="Use random tokens instead of dataset prompts")
     parser.add_argument("--all", action="store_true", help="Use numseqs from each dataset (union dataset with numseqs*4 total)")
-    
+    parser.add_argument("--chat_template", action="store_true", help="Wrap dataset prompts in chat template before tokenizing")
+
     # Debugging and logging
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (saves draft inputs during prefill)")
@@ -77,7 +78,7 @@ def parse_arguments():
     if args.eagle:
         args.spec = True
         assert args.llama, "Eagle currently only supports llama models"
-        assert args.temp == 0.0 and args.dtemp is None and args.ttemp is None, "Eagle currently only supports greedy decoding (temp=0)"
+        assert args.temp == 0.0 and args.dtemp is None, "Eagle currently only supports greedy decoding (temp=0)"
         assert getattr(args, 'async', False), "Eagle currently only supports async speculative decoding"
     return args
 

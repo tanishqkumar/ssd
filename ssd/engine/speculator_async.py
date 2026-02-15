@@ -89,9 +89,9 @@ class SpeculatorAsync(SpeculatorBase):
         for t in (input_ids, positions, cu_q, cu_k, slot_map, block_tables):
             dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
         
-        # 6) send eagle_acts if use_eagle
+        # 6) send eagle_acts if use_eagle (cast to draft dtype to match receive buffer)
         if eagle_acts is not None:
-            dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(eagle_acts.to(self.draft_dtype), dst=self.draft_runner_rank, group=self.async_pg)
 
         return SpeculateResult([], [])
 
