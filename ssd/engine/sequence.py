@@ -21,7 +21,8 @@ class Sequence:
         'last_spec_step_accepted_len', 'draft_block_table', 
         'num_draft_cached_tokens', 'temperature', 'max_new_tokens', 
         'ignore_eos', 'draft_async_temperature', 'target_async_temperature', 
-        'recovery_token_id', 'last_target_hidden_state'
+        'recovery_token_id', 'last_target_hidden_state',
+        'extend_eagle_acts', 'extend_token_ids', 'extend_count'
     ]
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
@@ -47,6 +48,10 @@ class Sequence:
 
         self.recovery_token_id = None
         self.last_target_hidden_state = None
+        # Extend-after-decode v5
+        self.extend_eagle_acts = None
+        self.extend_token_ids = None
+        self.extend_count = 0
 
     def __len__(self):
         return self.num_tokens

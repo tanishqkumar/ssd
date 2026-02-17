@@ -86,7 +86,7 @@ class DraftRunner(ModelRunner):
         eagle_acts = None
         if self.config.use_eagle:
             eagle_acts = torch.empty(total_new_tokens, 3 * self.config.d_model_target, 
-                                     dtype=torch.float16, device=self.device)
+                                     dtype=torch.bfloat16, device=self.device)
             dist.recv(eagle_acts, src=0, group=self.async_pg)
             assert eagle_acts is not None, "Draft must receive eagle_acts when use_eagle is True"
             print(f'[draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, total_slots={total_slots}, max_q={max_q}, max_k={max_k}, batch_size={batch_size}', flush=True)
@@ -98,7 +98,7 @@ class DraftRunner(ModelRunner):
 
         # 6) run the draft model in prefill mode
         if self.config.use_eagle:
-            num_last = 3  # Number of last positions to show
+            num_last = 1  # Number of last positions to show
             logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=bool(num_last == 1), hidden_states=eagle_acts)
             
             # Debug logging: show draft predictions after prefill
@@ -145,7 +145,101 @@ class DraftRunner(ModelRunner):
         self._arange_mq = torch.arange(MQ_LEN, device=d, dtype=torch.int64)
         self._arange_kp1 = torch.arange(K + 1, device=d, dtype=torch.int64)
 
-    def jit_speculate(self, 
+    def extend_kv(self, num_tokens, draft_block_tables, extend_counts,
+                  extend_eagle_acts, extend_token_ids):
+        """Extend-after-decode v5b: batched forward pass (single run_model call)."""
+        K = self.config.speculate_k
+        Kp1 = K + 1
+        B = num_tokens.shape[0]
+        pos_offset = -1 if self.config.use_eagle else 0
+        hidden_size = self.hf_config.hidden_size
+
+        # Filter to active batch elements only
+        active_mask = extend_counts > 0
+        n_active = int(active_mask.sum().item())
+        if n_active == 0:
+            return
+
+        active_indices = active_mask.nonzero(as_tuple=True)[0]
+        active_block_tables = draft_block_tables[active_indices]
+
+        # Build batched tensors: n_active sequences x K+1 query tokens each
+        total_q = n_active * Kp1
+        all_ids = torch.zeros(total_q, dtype=torch.int64, device=self.device)
+        all_pos = torch.zeros(total_q, dtype=torch.int64, device=self.device)
+        all_slot = torch.zeros(total_q, dtype=torch.int32, device=self.device)
+        all_hs = torch.zeros(total_q, hidden_size,
+                             dtype=self.model.fc.weight.dtype, device=self.device)
+        all_ctx = torch.zeros(n_active, dtype=torch.int32, device=self.device)
+
+        for i, b_idx in enumerate(active_indices.tolist()):
+            n_ext = int(extend_counts[b_idx].item())
+            curr_nt = int(num_tokens[b_idx].item())
+            start_pos = curr_nt - n_ext - 1 + pos_offset
+            offset = i * Kp1
+
+            # Real extend tokens
+            all_ids[offset:offset+n_ext] = extend_token_ids[b_idx, :n_ext]
+            real_pos = torch.arange(start_pos, start_pos + n_ext,
+                                    dtype=torch.int64, device=self.device)
+            all_pos[offset:offset+n_ext] = real_pos
+
+            # Slot mapping from block tables
+            dbt = draft_block_tables[b_idx]
+            blk_idx = (real_pos // self.block_size).clamp(max=dbt.shape[0]-1)
+            pos_in_blk = (real_pos % self.block_size).to(torch.int32)
+            blk_ids = dbt[blk_idx]
+            real_slots = (blk_ids * self.block_size + pos_in_blk).to(torch.int32)
+            all_slot[offset:offset+n_ext] = real_slots
+
+            # Pad to K+1 by repeating last real token (harmless overwrite to same slot)
+            if n_ext < Kp1:
+                all_ids[offset+n_ext:offset+Kp1] = all_ids[offset+n_ext-1]
+                all_pos[offset+n_ext:offset+Kp1] = all_pos[offset+n_ext-1]
+                all_slot[offset+n_ext:offset+Kp1] = all_slot[offset+n_ext-1]
+
+            # Hidden states: fc(eagle_acts) for target conditioning
+            ea = extend_eagle_acts[b_idx, :n_ext].to(self.model.fc.weight.dtype)
+            real_hs = self.model.fc(ea)
+            all_hs[offset:offset+n_ext] = real_hs
+            if n_ext < Kp1:
+                all_hs[offset+n_ext:offset+Kp1] = all_hs[offset+n_ext-1]
+
+            all_ctx[i] = start_pos
+
+        # Single batched forward pass (one run_model call for all active elements)
+        cu_seqlens_q = torch.arange(0, total_q + 1, Kp1,
+                                    dtype=torch.int32, device=self.device)
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=Kp1,
+            slot_mapping=all_slot,
+            context_lens=all_ctx,
+            block_tables=active_block_tables,
+        )
+        _ = self.run_model(
+            all_ids, all_pos,
+            is_prefill=False, last_only=False,
+            hidden_states=all_hs)
+        reset_context()
+
+        if not hasattr(self, '_ext_logged') or self._ext_logged < 30:
+            if not hasattr(self, '_ext_logged'):
+                self._ext_logged = 0
+            for i, b_idx in enumerate(active_indices.tolist()):
+                if self._ext_logged < 30:
+                    self._ext_logged += 1
+                    n_ext = int(extend_counts[b_idx].item())
+                    curr_nt = int(num_tokens[b_idx].item())
+                    start_pos = curr_nt - n_ext - 1 + pos_offset
+                    print(f'[EXTEND v5b step={self._ext_logged}] b={b_idx} n_ext={n_ext} '
+                          f'start_pos={start_pos} curr_nt={curr_nt} '
+                          f'ctx_len={start_pos} positions={list(range(start_pos, start_pos+n_ext))}',
+                          flush=True)
+
+
+    def jit_speculate(self,
                       request_keys: torch.Tensor, 
                       num_tokens: torch.Tensor, 
                       out_logits: torch.Tensor, 
@@ -169,7 +263,7 @@ class DraftRunner(ModelRunner):
         
         if self.config.use_eagle:
             assert target_recovery_activations is not None
-            hidden_states = self.model.fc(target_recovery_activations)
+            hidden_states = self.model.fc(target_recovery_activations.to(self.model.fc.weight.dtype))
             spec_activations = torch.empty(
                 input_ids.shape[0], self.config.speculate_k,
                 self.hf_config.hidden_size,
@@ -242,6 +336,7 @@ class DraftRunner(ModelRunner):
             match = torch.all(eq, dim=2)  # [B,T]
             cache_hits = match.any(dim=1)  # [B]
             ttl_hit += int(cache_hits.sum().item())
+            cache_hits[:] = 0  # FORCE JIT
             
             if self.config.verbose:
                 print(f"[hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
@@ -336,11 +431,31 @@ class DraftRunner(ModelRunner):
         temperatures = self.recv_tensor((B,), torch.float32)
 
         target_recovery_activations = torch.zeros(
-            B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
+            B, 3 * self.config.d_model_target, dtype=torch.bfloat16, device=self.device
         ) if self.config.use_eagle else None
 
-        if self.config.use_eagle: 
+        # EXTEND v5: receive extend data
+        extend_counts = None
+        extend_eagle_acts = None
+        extend_token_ids = None
+
+        if self.config.use_eagle:
             dist.recv(target_recovery_activations, src=0, group=self.async_pg)
+            # Receive extend data
+            extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
+            dist.recv(extend_counts, src=0, group=self.async_pg)
+            extend_eagle_acts = torch.zeros(
+                B, K, 3 * self.config.d_model_target,
+                dtype=torch.bfloat16, device=self.device)
+            dist.recv(extend_eagle_acts, src=0, group=self.async_pg)
+            extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
+            dist.recv(extend_token_ids, src=0, group=self.async_pg)
+
+            # Run extend forward pass to refresh KV BEFORE speculation
+            total_extend = int(extend_counts.sum().item())
+            if total_extend > 0:
+                self.extend_kv(num_tokens, draft_block_tables,
+                               extend_counts, extend_eagle_acts, extend_token_ids)
             
             # Print cache request details
             if self.config.verbose:
@@ -500,6 +615,7 @@ class DraftRunner(ModelRunner):
         if self.config.use_eagle:
             hidden_size = self.hf_config.hidden_size
             target_acts = partial_tree_decode_args["target_recovery_activations"]
+            target_acts = target_acts.to(self.model.fc.weight.dtype)
             prev_acts = partial_tree_decode_args["previous_activations"]
             assert target_acts is not None
             assert prev_acts is not None, "prev_acts must be provided when use_eagle is True"

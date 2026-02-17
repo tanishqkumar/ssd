@@ -65,6 +65,24 @@ class TargetDraftHandshake:
             self.recovery_activations = torch.stack([
                 seq.last_target_hidden_state for seq in self.seqs
             ], dim=0).to(self.device)
+
+            # EXTEND v5: prepare extend data
+            K = self.K
+            eagle_dim = self.seqs[0].last_target_hidden_state.shape[-1]
+            self.extend_counts = torch.zeros(self.B, dtype=torch.int64, device=self.device)
+            self.extend_eagle_acts = torch.zeros(
+                self.B, K, eagle_dim, dtype=torch.bfloat16, device=self.device)
+            self.extend_token_ids = torch.zeros(
+                self.B, K, dtype=torch.int64, device=self.device)
+            for i, seq in enumerate(self.seqs):
+                n_ext = getattr(seq, 'extend_count', 0)
+                if n_ext > 0 and getattr(seq, 'extend_eagle_acts', None) is not None:
+                    n_ext = min(n_ext, K)
+                    self.extend_counts[i] = n_ext
+                    self.extend_eagle_acts[i, :n_ext] = seq.extend_eagle_acts[:n_ext].to(self.device)
+                    if seq.extend_token_ids is not None:
+                        n_ids = min(len(seq.extend_token_ids), K)
+                        self.extend_token_ids[i, :n_ids] = seq.extend_token_ids[:n_ids].to(self.device)
         else:
             self.recovery_activations = None
         
@@ -97,6 +115,10 @@ class TargetDraftHandshake:
         
         if self.recovery_activations is not None:
             dist.send(self.recovery_activations, dst=self.draft_runner_rank, group=self.async_pg)
+            # EXTEND v5: send extend data
+            dist.send(self.extend_counts, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(self.extend_eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(self.extend_token_ids, dst=self.draft_runner_rank, group=self.async_pg)
     
     def receive_response(self, draft_cfg):
         """Receive the response: cache hits, speculations, and logits.

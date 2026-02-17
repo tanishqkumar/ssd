@@ -58,7 +58,7 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
             if args.size == "8":
                 return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B")
             elif args.size == "70":
-                return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.3-Instruct-70B")
+                return os.path.join(cache_dir, "models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge")
             else:
                 raise ValueError(f"EAGLE draft not available for Llama size {args.size}")
         else:
@@ -73,7 +73,7 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
             "1": "Llama-3.2-1B-Instruct",
             "3": "Llama-3.2-3B-Instruct",
             "8": "Llama-3.1-8B-Instruct",
-            "70": "Llama-3.1-70B-Instruct",
+            "70": "Llama-3.3-70B-Instruct",
         }
         if args.draft not in draft_size_to_model:
             raise ValueError(
@@ -104,7 +104,7 @@ def get_model_paths(args, cache_dir: str = "/data/tkumar/huggingface/hub/") -> T
             "1": "Llama-3.2-1B-Instruct",
             "3": "Llama-3.2-3B-Instruct",
             "8": "Llama-3.1-8B-Instruct",
-            "70": "Llama-3.1-70B-Instruct",
+            "70": "Llama-3.3-70B-Instruct",
         }
         if args.size not in size_to_model:
             raise ValueError(
@@ -176,7 +176,12 @@ def load_dataset_token_ids(
                     break
                 data = json.loads(line.strip())
                 text: str = data["text"]
-                tokens = tokenizer.encode(text, add_special_tokens=False)
+                # EXP21: Apply Llama 3 chat template
+                messages = [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}]
+                try:
+                    tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+                except Exception:
+                    tokens = tokenizer.encode(text, add_special_tokens=False)
 
                 target_len = max(len(tokens), input_len)
                 

@@ -282,7 +282,7 @@ class Eagle3DraftForCausalLM(nn.Module):
                 self._save_debug_inputs(input_ids, positions, hidden_states)
                 self._debug_saved = True
             
-            hidden_states_projected = self.fc(hidden_states)  # [num_tokens, d_model_draft]
+            hidden_states_projected = self.fc(hidden_states.to(self.fc.weight.dtype))  # [num_tokens, d_model_draft]
         else:
             hidden_states_projected = hidden_states # draft self-conditioning output, already d_model_draft from prenorm 
         

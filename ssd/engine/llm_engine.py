@@ -589,6 +589,21 @@ class LLMEngine:
                 accepted_len = len(new_suffixes[i])
                 idx = min(accepted_len - 1, eagle_acts.shape[1] - 1)
                 seq.last_target_hidden_state = eagle_acts[i, idx]
+
+                # EXTEND v5: store data for KV refresh on draft
+                # new_suffixes[i] = [recovery, S0, S1, ..., S_{A-1}]
+                # eagle_acts[i] = [EA_at_recovery_pos, EA_at_S0_pos, ...]
+                # S_j needs conditioning = eagle_acts[i, j] (target act BEFORE S_j)
+                n_extend = accepted_len - 1  # skip recovery
+                seq.extend_count = n_extend
+                if n_extend > 0:
+                    seq.extend_eagle_acts = eagle_acts[i, :n_extend].clone()
+                    seq.extend_token_ids = torch.tensor(
+                        new_suffixes[i][1:1+n_extend],
+                        dtype=torch.int64, device=eagle_acts.device)
+                else:
+                    seq.extend_eagle_acts = None
+                    seq.extend_token_ids = None
         else:
             new_suffixes, recovery_tokens = verify_result
 

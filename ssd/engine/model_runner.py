@@ -618,12 +618,12 @@ class ModelRunner:
                 logits = self.model.compute_logits(outputs, last_only)
                 return logits 
 
-        elif is_tree_decode: 
-            return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits)
+        elif is_tree_decode:
+            return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits, hidden_states=hidden_states)
         elif is_mq_kp1: # verify or glue decode, draft or target, "verify" ~ mq decode of len K+1
-            return run_verify_cudagraph(self, input_ids, positions, last_only, self.graph_vars["verify"])
-        else: # draft decoding in sync spec 
-            return run_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["decode"])
+            return run_verify_cudagraph(self, input_ids, positions, last_only, self.graph_vars["verify"], hidden_states=hidden_states)
+        else: # draft decoding in sync spec
+            return run_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["decode"], hidden_states=hidden_states)
 
 
     # should add spec_k that just loops this k times
