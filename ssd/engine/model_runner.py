@@ -441,7 +441,7 @@ class ModelRunner:
         if self.config.use_eagle and self.is_draft:
             num_tokens = num_seqs * max_model_len
             d_model_target = self.config.d_model_target or 4096
-            hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=torch.float16, device=self.device)
+            hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
         
         self.run(seqs, True, hidden_states=hidden_states)
         torch.cuda.empty_cache()
@@ -449,7 +449,7 @@ class ModelRunner:
     def allocate_kv_cache(self):
         print(f'inside allocate_kv_cache -- ', flush=True)
         config = self.config
-        hf_config = config.hf_config 
+        hf_config = self.hf_config
         
         # Simplify: just look at free memory on the GPU, and allocate up to gpu_memory_utilization * free.
         free, _ = torch.cuda.mem_get_info()
@@ -590,8 +590,8 @@ class ModelRunner:
             self.hf_config.head_dim,
             self.block_size,
             custom_mask=custom_mask,
-            q_data_type=torch.bfloat16 if not self.config.use_eagle else torch.float16,
-            kv_data_type=torch.bfloat16 if not self.config.use_eagle else torch.float16,
+            q_data_type=self.hf_config.torch_dtype,
+            kv_data_type=self.hf_config.torch_dtype,
         )
 
     @torch.inference_mode()
