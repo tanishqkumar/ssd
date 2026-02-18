@@ -60,43 +60,52 @@ class DraftRunner(ModelRunner):
         # 1) Receive metadata
         metadata = torch.zeros(5, dtype=torch.int64, device=self.device)
         dist.recv(metadata, src=0, group=self.async_pg)
-        total_new_tokens, total_slots, max_q, max_k, batch_size = metadata.tolist()
+        total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = metadata.tolist()
+        if use_eagle:
+            assert eagle_act_dim == 3 * self.config.d_model_target, (
+                f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
+            )
 
         # 2) allocate zeros tensors of the exact same shape and device
         input_ids = torch.zeros(
             total_new_tokens, dtype=torch.int64, device=self.device)
-        positions = torch.zeros(
-            total_new_tokens, dtype=torch.int64, device=self.device)
-        cu_q = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device)
-        cu_k = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device)
-        slot_map = torch.zeros(
-            total_slots, dtype=torch.int32, device=self.device)
-        max_blocks = (self.config.max_model_len +
-                      self.block_size - 1) // self.block_size
-        block_tables = torch.zeros( 
+        num_tokens = torch.zeros(
+            batch_size, dtype=torch.int64, device=self.device)
+        draft_block_table = torch.zeros(
             batch_size, max_blocks, dtype=torch.int32, device=self.device)
+        eagle_acts = None
+        if use_eagle:
+            eagle_acts = torch.zeros(
+                total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
+            )
 
         # 3) receive in the exact same order:
-        for t in (input_ids, positions, cu_q, cu_k, slot_map, block_tables):
-            dist.recv(t, src=0, group=self.async_pg)
+        for t in (input_ids, num_tokens, draft_block_table, eagle_acts):
+            if t is not None:  # in case eagle_acts is None
+                dist.recv(t, src=0, group=self.async_pg)
 
         # 4) receive eagle_acts if use_eagle
         eagle_acts = None
         if self.config.use_eagle:
-            eagle_acts = torch.empty(total_new_tokens, 3 * self.config.d_model_target, 
-                                     dtype=torch.float16, device=self.device)
-            dist.recv(eagle_acts, src=0, group=self.async_pg)
             assert eagle_acts is not None, "Draft must receive eagle_acts when use_eagle is True"
             print(f'[draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, total_slots={total_slots}, max_q={max_q}, max_k={max_k}, batch_size={batch_size}', flush=True)
             print(f'[draft_async_prefill] eagle_acts.shape={eagle_acts.shape}, input_ids.shape={input_ids.shape}', flush=True)
 
+        prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
+
         # 5) set up context exactly like prepare_prefill() does:
-        set_context(is_prefill=True, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max_q, max_seqlen_k=max_k,
-                    slot_mapping=slot_map, context_lens=None) # , block_tables=block_tables, commenting this out essentially removes prefix caching
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=prefill_ctxt["cu_seqlens_q"],
+            cu_seqlens_k=prefill_ctxt["cu_seqlens_k"],
+            max_seqlen_q=prefill_ctxt["max_seqlen_q"],
+            max_seqlen_k=prefill_ctxt["max_seqlen_k"],
+            slot_mapping=prefill_ctxt["slot_map"],
+            context_lens=None,
+        ) # , block_tables=block_tables, commenting this out essentially removes prefix caching
 
         # 6) run the draft model in prefill mode
+        positions = prefill_ctxt["positions"]
         if self.config.use_eagle:
             num_last = 3  # Number of last positions to show
             logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=bool(num_last == 1), hidden_states=eagle_acts)
@@ -397,6 +406,45 @@ class DraftRunner(ModelRunner):
 
         # from now on, need to thread cache_hits through tree decode and not assume that MQ_LEN is global constant, but varies with iteration depending on prev hit/miss
         return glue_decode_input_ids, partial_tree_decode_args 
+
+    def prepare_prefill_ctxt(
+        self,
+        num_tokens: torch.Tensor,  # [B]
+        draft_block_table: torch.Tensor,  # [B, max_blocks]
+    ) -> dict:
+        """
+        Prepare context for prefill forward pass.
+        """
+        B = num_tokens.shape[0]
+        # pos_offset = -1 if self.config.use_eagle else 0
+        positions = torch.cat([
+            torch.arange(num_tokens[i], device=self.device) for i in range(B)
+        ], dim=0).to(torch.int64)
+        batch_indices = torch.cat([
+            torch.full((num_tokens[i],), i, device=self.device) for i in range(B)
+        ], dim=0).to(torch.int64)
+        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q[1:] = torch.cumsum(num_tokens, dim=0)
+        max_seqlen_q = num_tokens.max().item()
+
+        # Calculate block indices and offsets for ALL positions
+        block_indices = (positions // self.block_size).to(torch.int64)
+        offsets = (positions % self.block_size).to(torch.int32)
+
+        # Get block IDs for each position from dbt
+        block_ids = draft_block_table[batch_indices, block_indices]
+
+        # Calculate slot_map for each position
+        slot_map = (block_ids * self.block_size + offsets).to(torch.int32)
+
+        return {
+            "positions": positions,
+            "slot_map": slot_map,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_q.clone(),
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_q,
+        }
 
     
     def prepare_glue_decode_ctxt(self, num_tokens, input_ids, dbt, B):
