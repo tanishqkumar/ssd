@@ -40,37 +40,19 @@ class SpeculatorAsync(SpeculatorBase):
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
-        skip_first = 1 if eagle_acts is not None else 0
-
-        # 1) build all the prefill payload in one shot
-        input_ids, positions, cu_q, cu_k, max_q, max_k, slot_map = \
-            prepare_prefill_tensors_from_seqs(
-                seqs,
-                block_size=self.kvcache_block_size,
-                is_draft=True,
-                skip_first_token=skip_first
-            )
-        
-        # Slice activations to match draft input
-        if eagle_acts is not None:
-            sliced_acts = []
-            offset = 0
-            for seq in seqs:
-                seq_len = seq.num_prompt_tokens
-                sliced_acts.append(eagle_acts[offset:offset + seq_len - 1])
-                offset += seq_len
-            eagle_acts = torch.cat(sliced_acts, dim=0)
-            assert eagle_acts.shape[0] == input_ids.shape[0], \
-                f"Activation length {eagle_acts.shape[0]} != input_ids length {input_ids.shape[0]}"
-        
-        # 2) pad draft_block_table → block_tables
+        input_ids = []
+        num_tokens = []
+        for seq in seqs:
+            input_ids.extend(seq.token_ids)
+            num_tokens.append(len(seq.token_ids))
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
+        num_tokens = torch.tensor(num_tokens, dtype=torch.int64, device=self.device)
         max_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
-        block_tables = torch.tensor(
+        draft_block_table = torch.tensor(
             [s.draft_block_table + [-1] *
                 (max_blocks - len(s.draft_block_table)) for s in seqs],
             dtype=torch.int32, device=self.device,
         )
-        
         # 3) send cmd=1
         cmd = torch.tensor([1], dtype=torch.int64, device=self.device)
         dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
@@ -78,20 +60,22 @@ class SpeculatorAsync(SpeculatorBase):
         # 4) send metadata for tensor reconstruction
         metadata = torch.tensor([
             input_ids.size(0),
-            slot_map.size(0),
-            max_q,
-            max_k,
             len(seqs),  # batch_size
+            max_blocks,
+            1 if eagle_acts is not None else 0,
+            eagle_acts.shape[1] if eagle_acts is not None else 0,
         ], dtype=torch.int64, device=self.device)
         dist.send(metadata, dst=self.draft_runner_rank, group=self.async_pg)
 
-        # 5) send each tensor in a fixed order
-        for t in (input_ids, positions, cu_q, cu_k, slot_map, block_tables):
-            dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
-        
-        # 6) send eagle_acts if use_eagle
         if eagle_acts is not None:
-            dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
+            assert eagle_acts.shape[0] == input_ids.shape[0], (
+                f"Eagle activations length {eagle_acts.shape[0]} != input_ids length {input_ids.shape[0]}"
+            )
+
+        # 5) send each tensor in a fixed order
+        for t in (input_ids, num_tokens, draft_block_table, eagle_acts):
+            if t is not None:  # in case eagle_acts is None
+                dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
 
         return SpeculateResult([], [])
 
