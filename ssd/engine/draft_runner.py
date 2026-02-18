@@ -88,12 +88,6 @@ class DraftRunner(ModelRunner):
         # 4) receive eagle_acts if use_eagle
         eagle_acts = None
         if self.config.use_eagle:
-<<<<<<< HEAD
-=======
-            eagle_acts = torch.empty(total_new_tokens, 3 * self.config.d_model_target,
-                                     dtype=self.hf_config.torch_dtype, device=self.device)
-            dist.recv(eagle_acts, src=0, group=self.async_pg)
->>>>>>> main
             assert eagle_acts is not None, "Draft must receive eagle_acts when use_eagle is True"
 
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
