@@ -68,11 +68,26 @@ class Config:
                     self.fan_out_list_miss = self.fan_out_list 
                 assert sum(self.fan_out_list_miss) == sum(self.fan_out_list), "ERROR in Config: fan_out_list_miss must be the same as fan_out_list"
                 
-        if self.use_eagle: 
+        if self.use_eagle:
             if self.eagle_layers is None:
                 L = self.hf_config.num_hidden_layers
                 # self.eagle_layers = [3, L//2, L-3]
                 self.eagle_layers = [2, L//2, L-3] # [2, 16, 29] outputs, ie. [3, L//2+1, L-2] inputs
                 print(f'[Config] just set eagle_layers={self.eagle_layers}', flush=True)
+            # Eagle draft must use target's rope_theta (draft config may default to wrong value)
+            if self.speculate and self.draft_hf_config is not None:
+                target_rope_theta = getattr(self.hf_config, 'rope_theta', 500000.0)
+                draft_rope_theta = getattr(self.draft_hf_config, 'rope_theta', 10000.0)
+                if target_rope_theta != draft_rope_theta:
+                    print(f'[Config] Overriding eagle draft rope_theta: {draft_rope_theta} -> {target_rope_theta}', flush=True)
+                    self.draft_hf_config.rope_theta = target_rope_theta
+                # Also override max_position_embeddings for correct RoPE cache size
+                # NOTE: Do NOT change max_model_len here - it was already correctly capped.
+                # Only change draft_hf_config.max_position_embeddings for RoPE.
+                target_max_pos = getattr(self.hf_config, 'max_position_embeddings', 8192)
+                draft_max_pos = getattr(self.draft_hf_config, 'max_position_embeddings', 2048)
+                if target_max_pos != draft_max_pos:
+                    print(f'[Config] Overriding eagle draft max_position_embeddings: {draft_max_pos} -> {target_max_pos}', flush=True)
+                    self.draft_hf_config.max_position_embeddings = target_max_pos
         
         assert self.max_num_batched_tokens >= self.max_model_len
