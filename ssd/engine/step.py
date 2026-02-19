@@ -89,18 +89,17 @@ class SpecDecodeStep(InferenceStep):
         return sum(len(seq) for seq in seqs)
 
     def decode(self, seqs: list[Sequence]) -> int:
-        # It's important to not modify the original Sequence list in place, since it's used by the scheduler.
-        # The original Sequence list is updated in self.scheduler.postprocess_speculate to reflect the
-        # new suffixes and recovery tokens after speculation and verification.
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         if _prof:
             torch.cuda.synchronize()
             _t0 = perf_counter()
 
-        seqs_orig = seqs
-        seqs_copy = [seq.clone_spec() for seq in seqs_orig]
-        # For Eagle, we signal eagle mode so the handshake sends target activations.
-        # The actual activations are stored in seq.last_target_hidden_state (set by postprocess_speculate).
+        # Save lightweight state instead of expensive clone_spec deep copy.
+        # speculate() modifies: token_ids (append+extend), num_tokens, last_token, num_draft_cached_tokens
+        # verify() only reads seq state, does not modify it.
+        # postprocess_speculate() needs the ORIGINAL state to apply new suffixes.
+        saved = [(len(seq.token_ids), seq.num_tokens, seq.last_token, seq.num_draft_cached_tokens) for seq in seqs]
+
         eagle_sentinel = True if self.eagle else None
         in_verify_result = VerifyResult(
             new_suffixes=[],
@@ -108,7 +107,7 @@ class SpecDecodeStep(InferenceStep):
             eagle_acts=eagle_sentinel,
         )
         #### STEP 1: SPECULATE ####
-        speculate_result = self.speculator.speculate(seqs_copy, in_verify_result)
+        speculate_result = self.speculator.speculate(seqs, in_verify_result)
 
         if _prof:
             torch.cuda.synchronize()
@@ -124,7 +123,7 @@ class SpecDecodeStep(InferenceStep):
                 print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
 
         #### STEP 2: VERIFY ####
-        out_verify_result = self.verifier.verify(seqs_copy, speculate_result, eagle=self.eagle)
+        out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
 
         if _prof:
             torch.cuda.synchronize()
@@ -137,10 +136,16 @@ class SpecDecodeStep(InferenceStep):
                 decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
                 print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
 
+        # Restore original seq state before postprocess (undo speculate's modifications)
+        for seq, (orig_len, orig_nt, orig_lt, orig_ndc) in zip(seqs, saved):
+            del seq.token_ids[orig_len:]
+            seq.num_tokens = orig_nt
+            seq.last_token = orig_lt
+            seq.num_draft_cached_tokens = orig_ndc
+
         #### STEP 3: POSTPROCESS ####
-        # The postprocess step handles BOTH block managers and seq state (including EAGLE activations)
         self.scheduler.postprocess_speculate(
-            seqs_orig,
+            seqs,
             out_verify_result.new_suffixes,
             out_verify_result.recovery_tokens,
             eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
