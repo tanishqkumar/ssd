@@ -94,16 +94,17 @@ class TargetDraftHandshake:
         meta = torch.tensor([self.B, self.K, self.F], dtype=torch.int64, device=self.device)
         dist.send(meta, dst=self.draft_runner_rank, group=self.async_pg)
 
-        # Send payload data
+        # Send payload + temperatures in one fused int64 burst
         assert self.num_tokens.shape == (self.B,)
+        temps_as_int64 = self.temperatures.view(torch.int32).to(torch.int64)
         send_int64(
             self.async_pg,
             self.draft_runner_rank,
             self.cache_keys,
             self.num_tokens,
             self.draft_block_tables.to(torch.int64),
+            temps_as_int64,
         )
-        dist.send(self.temperatures, dst=self.draft_runner_rank, group=self.async_pg)
 
         if self.recovery_activations is not None:
             # Cast to draft dtype to match draft receive buffer

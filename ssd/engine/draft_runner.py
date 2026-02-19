@@ -58,30 +58,25 @@ class DraftRunner(ModelRunner):
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
 
-        # 1) Receive metadata
+        # 1) Receive fused payload: metadata(5) + input_ids + positions + cu_q + cu_k + slot_map + block_tables
+        max_blocks = (self.config.max_model_len +
+                      self.block_size - 1) // self.block_size
+        # First recv metadata to learn sizes
         metadata = torch.zeros(5, dtype=torch.int64, device=self.device)
         dist.recv(metadata, src=0, group=self.async_pg)
         total_new_tokens, total_slots, max_q, max_k, batch_size = metadata.tolist()
 
-        # 2) allocate zeros tensors of the exact same shape and device
-        input_ids = torch.zeros(
-            total_new_tokens, dtype=torch.int64, device=self.device)
-        positions = torch.zeros(
-            total_new_tokens, dtype=torch.int64, device=self.device)
-        cu_q = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device)
-        cu_k = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device)
-        slot_map = torch.zeros(
-            total_slots, dtype=torch.int32, device=self.device)
-        max_blocks = (self.config.max_model_len +
-                      self.block_size - 1) // self.block_size
-        block_tables = torch.zeros( 
-            batch_size, max_blocks, dtype=torch.int32, device=self.device)
-
-        # 3) receive in the exact same order:
-        for t in (input_ids, positions, cu_q, cu_k, slot_map, block_tables):
-            dist.recv(t, src=0, group=self.async_pg)
+        # Recv all tensors in one fused int64 burst
+        fused_total = 2 * total_new_tokens + 2 * (batch_size + 1) + total_slots + batch_size * max_blocks
+        fused = recv_int64(self.async_pg, src=0, total_length=fused_total, device=self.device)
+        off = 0
+        input_ids = fused[off:off + total_new_tokens]; off += total_new_tokens
+        positions = fused[off:off + total_new_tokens]; off += total_new_tokens
+        cu_q = fused[off:off + batch_size + 1].to(torch.int32); off += batch_size + 1
+        cu_k = fused[off:off + batch_size + 1].to(torch.int32); off += batch_size + 1
+        slot_map = fused[off:off + total_slots].to(torch.int32); off += total_slots
+        block_tables = fused[off:off + batch_size * max_blocks].view(batch_size, max_blocks).to(torch.int32); off += batch_size * max_blocks
+        assert off == fused_total
 
         # 4) receive eagle_acts if use_eagle
         eagle_acts = None
@@ -295,10 +290,10 @@ class DraftRunner(ModelRunner):
         # not going to get any preempted or finished seqs here since we just postprocessed+scheduled before this
         B, K, F = meta.tolist()
 
-        # Receive all request payload in one fused int64 burst then temperatures
+        # Receive all request payload in one fused int64 burst (includes temperatures)
         max_blocks = (self.config.max_model_len +
                       self.block_size - 1) // self.block_size
-        fused_total = (3 * B) + B + (B * max_blocks)
+        fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
         fused_req = recv_int64(self.async_pg, src=0,
                                total_length=fused_total, device=self.device)
         off = 0
@@ -311,8 +306,10 @@ class DraftRunner(ModelRunner):
         draft_block_tables = fused_req[off:off + B *
                                        max_blocks].view(B, max_blocks).to(torch.int32)
         off += B * max_blocks
+        temps_as_int64 = fused_req[off:off + B]
+        off += B
         assert off == fused_total
-        temperatures = self.recv_tensor((B,), torch.float32)
+        temperatures = temps_as_int64.to(torch.int32).view(torch.float32)
 
         target_recovery_activations = torch.zeros(
             B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
