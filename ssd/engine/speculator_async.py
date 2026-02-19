@@ -39,6 +39,11 @@ class SpeculatorAsync(SpeculatorBase):
         self.tokenizer = tokenizer
         self.verbose = verbose
 
+        # Pre-allocate speculate() buffers (avoid torch.tensor(device=cuda) sync every step)
+        self.K = lookahead
+        self._recovery_buf = torch.empty(1, dtype=torch.int64, device=device)
+        self._speculations_buf = torch.empty(1, lookahead + 1, dtype=torch.int64, device=device)
+
         # Pre-allocate persistent handshake handler (reused every step)
         self._handshake = TargetDraftHandshake(
             lookahead=lookahead,
@@ -143,11 +148,16 @@ class SpeculatorAsync(SpeculatorBase):
         self._handshake.eagle = eagle
         speculations_tokens, logits_q, cache_hits = self._handshake.execute(seqs)
 
-        # The first column of the final speculation tensor is the recovery tokens
-        recovery_tokens_tensor = torch.tensor(
-            [seq.recovery_token_id for seq in seqs], dtype=torch.int64, device=self.device)
-        speculations = torch.cat(
-            [recovery_tokens_tensor.unsqueeze(1), speculations_tokens], dim=1)
+        # Build speculations using pre-allocated buffers (avoids torch.tensor(device=cuda) sync)
+        B = len(seqs)
+        if B != self._recovery_buf.shape[0]:
+            self._recovery_buf = torch.empty(B, dtype=torch.int64, device=self.device)
+            self._speculations_buf = torch.empty(B, self.K + 1, dtype=torch.int64, device=self.device)
+        _rec_cpu = torch.tensor([seq.recovery_token_id for seq in seqs], dtype=torch.int64)
+        self._recovery_buf.copy_(_rec_cpu, non_blocking=True)
+        self._speculations_buf[:, 0] = self._recovery_buf
+        self._speculations_buf[:, 1:] = speculations_tokens
+        speculations = self._speculations_buf
 
         # Update seqs with all speculated tokens for the verify step to pass through the target model
         for i, seq in enumerate(seqs):
