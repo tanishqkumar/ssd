@@ -358,7 +358,8 @@ class DraftRunner(ModelRunner):
         # Send response: cache_hits and spec_tokens_flat in one fused message
         fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
         dist.send(fused_response, dst=0, group=self.async_pg)
-        dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
+        if (temperatures != 0).any().item():
+            dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,  

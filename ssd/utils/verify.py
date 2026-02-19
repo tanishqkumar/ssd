@@ -12,6 +12,7 @@ def verify(
     sampler_x: float | None = None,
     async_fan_out: int | None = None,
     jit_speculate: bool = False,
+    all_greedy: bool = False,
 ) -> tuple[list[list[int]], list[int]]:
     """
     Speculative‐decoding verification:
@@ -25,6 +26,27 @@ def verify(
     device = logits_p.device
     B, Kp1, V = logits_p.shape
     K = Kp1 - 1
+
+    # FAST PATH: all temps == 0, single GPU->CPU sync
+    if all_greedy:
+        _draft = speculations[:, 1:]
+        _preds = logits_p.argmax(dim=-1)
+        _match = (_draft == _preds[:, :-1]).int()
+        _packed = torch.cat([speculations[:, 0], _preds.reshape(-1),
+                             _draft.reshape(-1), _match.reshape(-1)])
+        _cpu = _packed.cpu().tolist()
+        _suffixes, _recs = [], []
+        for _b in range(B):
+            _s = _cpu[_b]
+            _p = _cpu[B + _b * Kp1: B + (_b + 1) * Kp1]
+            _d = _cpu[B + B * Kp1 + _b * K: B + B * Kp1 + (_b + 1) * K]
+            _m = _cpu[B + B * Kp1 + B * K + _b * K: B + B * Kp1 + B * K + (_b + 1) * K]
+            _n = 0
+            while _n < K and _m[_n]:
+                _n += 1
+            _suffixes.append([_s] + _d[:_n])
+            _recs.append(int(_p[_n]))
+        return _suffixes, _recs
 
     # 1) Greedy argmax paths (for all, we precompute preds_p)
     # ------------------------------------------------------
