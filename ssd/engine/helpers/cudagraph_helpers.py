@@ -137,6 +137,7 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
 
 cache = {}
 
+_plan_event = None  # Lazy-init CUDA event for plan() sync
 PROFILE = os.environ.get("SSD_PROFILE", "0") == "1"
 
 @torch.inference_mode()
@@ -340,11 +341,12 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     total_num_rows = int(qo_indptr_cpu[-1].item())
     wrapper._kv_lens_buffer[:len(kv_indptr_cpu) - 1].copy_(cache["kv_lens_gpu"][step], non_blocking=True)
 
-    # Sync before plan() to prevent FlashInfer pinned buffer race condition.
-    # FlashInfer uses a single pinned CPU workspace buffer across all plan() calls.
-    # Without sync, CPU can overwrite the pinned buffer before GPU DMA reads prior step's data.
-    # BASELINE avoids this implicitly via pageable H2D copies (which sync per CUDA spec).
-    torch.cuda.synchronize()
+    # Event-based sync: only wait for this stream's copies, not all CUDA streams.
+    global _plan_event
+    if _plan_event is None:
+        _plan_event = torch.cuda.Event()
+    _plan_event.record()
+    _plan_event.synchronize()
 
     plan_args = [
         wrapper._float_workspace_buffer, wrapper._int_workspace_buffer,
