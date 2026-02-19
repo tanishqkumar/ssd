@@ -39,6 +39,8 @@ def _segment_packbits_no_sync(x_gpu, mask_indptr_cpu, bitorder="little"):
     return y, indptr_new_gpu
 
 
+_verify_cu_cache = {}  # cached cu_seqlens_q per (bs, k+1, device)
+
 ## RUN CUDAGRAPHS
 @torch.inference_mode()
 def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_vars):
@@ -50,12 +52,11 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
         x for x in model_runner.graph_bs_list["verify"] if x >= orig_bs)
     graph = model_runner.graphs["verify"][wrapper_bs]
 
-    for k, v in graph_vars.items():
-        if k != "outputs":
-            v.zero_()
-
-    # Pad to graph bucket size if needed (fixes B>=6 crash from non-monotonic cu_seqlens_q)
+    # Only zero graph_vars when padding needed (exact bucket match skips zeroing)
     if wrapper_bs > orig_bs:
+        for k, v in graph_vars.items():
+            if k != "outputs":
+                v.zero_()
         pad_bs = wrapper_bs - orig_bs
         pad_flat = pad_bs * k_plus_1
         dev = input_ids.device
@@ -81,12 +82,13 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     graph_vars["positions"][:bs * k_plus_1] = positions
     graph_vars["slot_mapping"][:bs * k_plus_1] = slot_mapping
     graph_vars["context_lens"][:bs] = context_lens
-    # Construct cu_seqlens_q for FULL padded batch (monotonically increasing)
-    seqlen_q = torch.full(
-        (bs,), k_plus_1, dtype=torch.int32, device=graph_vars["cu_seqlens_q"].device)
-    cu = graph_vars["cu_seqlens_q"][:bs + 1]
-    cu.zero_()
-    cu[1:].copy_(torch.cumsum(seqlen_q, 0))
+    # Cache cu_seqlens_q: always arange(bs+1)*k_plus_1 for verify
+    global _verify_cu_cache
+    _cu_key = (bs, k_plus_1, graph_vars["cu_seqlens_q"].device)
+    if _cu_key not in _verify_cu_cache:
+        _verify_cu_cache[_cu_key] = torch.arange(
+            bs + 1, dtype=torch.int32, device=graph_vars["cu_seqlens_q"].device) * k_plus_1
+    graph_vars["cu_seqlens_q"][:bs + 1] = _verify_cu_cache[_cu_key]
 
     if block_tables is not None:
         graph_vars["block_tables"][:bs, :block_tables.size(1)] = block_tables

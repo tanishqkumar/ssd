@@ -85,6 +85,7 @@ class Verifier(VerifierBase):
             seq.draft_temperature if seq.draft_temperature is not None else seq.temperature
             for seq in seqs
         ]
+        _all_greedy = all(t == 0 for t in temps_target) and all(t == 0 for t in temps_draft)
         temperatures_target = torch.tensor(temps_target, dtype=torch.float32, device=self.device)
         temperatures_draft = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)
 
@@ -98,6 +99,7 @@ class Verifier(VerifierBase):
             sampler_x=self.sampler_x,
             async_fan_out=self.async_fan_out,
             jit_speculate=self.jit_speculate,
+            all_greedy=_all_greedy,
         )
 
         self.metrics["target_verify_times"].append(perf_counter() - _tv0)
