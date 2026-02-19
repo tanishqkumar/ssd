@@ -3,8 +3,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, SpeculatorBase
-from ssd.engine.helpers.runner_helpers import prepare_prefill_tensors_from_seqs
-from ssd.engine.helpers.handshake_helpers import TargetDraftHandshake
+from ssd.engine.helpers.runner_helpers import prepare_prefill_payload, send_speculation_request, receive_speculation_response
 from ssd.engine.sequence import Sequence
 from ssd.utils.misc import decode_tokens
 
@@ -40,41 +39,21 @@ class SpeculatorAsync(SpeculatorBase):
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
-        input_ids = []
-        num_tokens = []
-        for seq in seqs:
-            input_ids.extend(seq.token_ids)
-            num_tokens.append(len(seq.token_ids))
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
-        num_tokens = torch.tensor(num_tokens, dtype=torch.int64, device=self.device)
+        input_id_list = [seq.token_ids for seq in seqs]
+
         max_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
-        draft_block_table = torch.tensor(
-            [s.draft_block_table + [-1] *
-                (max_blocks - len(s.draft_block_table)) for s in seqs],
-            dtype=torch.int32, device=self.device,
-        )
-        # 3) send cmd=1
-        cmd = torch.tensor([1], dtype=torch.int64, device=self.device)
-        dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
-
-        # 4) send metadata for tensor reconstruction
-        metadata = torch.tensor([
-            input_ids.size(0),
-            len(seqs),  # batch_size
+        cmd, metadata, input_ids, num_tokens, draft_block_table, eagle_acts = prepare_prefill_payload(
+            input_id_list,
+            eagle_acts,
+            self.device,
             max_blocks,
-            1 if eagle_acts is not None else 0,
-            eagle_acts.shape[1] if eagle_acts is not None else 0,
-        ], dtype=torch.int64, device=self.device)
+            [seq.draft_block_table for seq in seqs],
+        )
+
+        dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
         dist.send(metadata, dst=self.draft_runner_rank, group=self.async_pg)
-
-        if eagle_acts is not None:
-            assert eagle_acts.shape[0] == input_ids.shape[0], (
-                f"Eagle activations length {eagle_acts.shape[0]} != input_ids length {input_ids.shape[0]}"
-            )
-
-        # 5) send each tensor in a fixed order
         for t in (input_ids, num_tokens, draft_block_table, eagle_acts):
-            if t is not None:  # in case eagle_acts is None
+            if t is not None:
                 dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
 
         return SpeculateResult([], [])
@@ -112,7 +91,7 @@ class SpeculatorAsync(SpeculatorBase):
 
         # hit draft tree cache via handshake API, this bounds them
         eagle = verify_result.eagle_acts is not None
-        speculations_tokens, logits_q, cache_hits = self.target_draft_handshake(seqs, eagle)
+        speculations_tokens, logits_q, cache_hits = self.speculation_request(seqs, eagle)
 
         # The first column of the final speculation tensor is the recovery tokens
         recovery_tokens_tensor = torch.tensor(
@@ -140,22 +119,29 @@ class SpeculatorAsync(SpeculatorBase):
         return SpeculateResult(speculations, logits_q, cache_hits)
 
 
-    def target_draft_handshake(self, seqs: list[Sequence], eagle: bool):
+    def speculation_request(self, seqs: list[Sequence], eagle: bool):
         """Send a spec request command with cache keys to get speculations/logits."""
 
-        # Use the handshake helper to handle the complete protocol
-        handshake = TargetDraftHandshake(
+        send_speculation_request(
             seqs=seqs,
             lookahead=self.lookahead,
             async_fan_out=self.async_fan_out,
             max_blocks=self.max_blocks,
             eagle=eagle,
+            draft_dtype=self.draft_dtype,
+            device=self.device,
+            async_pg=self.async_pg,
+            draft_runner_rank=self.draft_runner_rank
+        )
+
+        speculations, logits_q, cache_hits = receive_speculation_response(
+            batch_size=len(seqs),
+            lookahead=self.lookahead,
             vocab_size=self.vocab_size,
             draft_dtype=self.draft_dtype,
             device=self.device,
             async_pg=self.async_pg,
             draft_runner_rank=self.draft_runner_rank
         )
-        speculations, logits_q, cache_hits = handshake.execute_full_handshake()
 
         return speculations, logits_q, cache_hits
