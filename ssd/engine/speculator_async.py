@@ -7,6 +7,7 @@ from ssd.engine.helpers.runner_helpers import prepare_prefill_tensors_from_seqs
 from ssd.engine.helpers.handshake_helpers import TargetDraftHandshake
 from ssd.engine.sequence import Sequence
 from ssd.utils.misc import decode_tokens
+from ssd.utils.async_helpers.nccl_pack import send_int64
 
 
 class SpeculatorAsync(SpeculatorBase):
@@ -75,7 +76,7 @@ class SpeculatorAsync(SpeculatorBase):
         cmd = torch.tensor([1], dtype=torch.int64, device=self.device)
         dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
 
-        # 4) send metadata for tensor reconstruction
+        # 4) send metadata then all tensors in one fused int64 burst
         metadata = torch.tensor([
             input_ids.size(0),
             slot_map.size(0),
@@ -85,9 +86,17 @@ class SpeculatorAsync(SpeculatorBase):
         ], dtype=torch.int64, device=self.device)
         dist.send(metadata, dst=self.draft_runner_rank, group=self.async_pg)
 
-        # 5) send each tensor in a fixed order
-        for t in (input_ids, positions, cu_q, cu_k, slot_map, block_tables):
-            dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
+        # 5) fuse all 6 tensors into one send (was 6 separate sends)
+        send_int64(
+            self.async_pg,
+            self.draft_runner_rank,
+            input_ids,
+            positions,
+            cu_q.to(torch.int64),
+            cu_k.to(torch.int64),
+            slot_map.to(torch.int64),
+            block_tables.to(torch.int64),
+        )
         
         # 6) send eagle_acts if use_eagle (cast to draft dtype to match receive buffer)
         if eagle_acts is not None:
