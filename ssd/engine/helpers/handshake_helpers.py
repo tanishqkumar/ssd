@@ -44,9 +44,6 @@ class TargetDraftHandshake:
         self.num_tokens_buf = torch.empty(B, dtype=torch.int64, device=d)
         self.temps_buf = torch.empty(B, dtype=torch.float32, device=d)
         self.block_tables_buf = torch.full((B, self.max_blocks), -1, dtype=torch.int32, device=d)
-        # Pre-allocate int64 conversion buffers (avoid per-step allocation)
-        self._block_tables_int64 = torch.empty(B, self.max_blocks, dtype=torch.int64, device=d)
-        self._temps_int64 = torch.empty(B, dtype=torch.int64, device=d)
         # Recv: pre-allocated
         self.fused_response = torch.empty(B + B * self.K, dtype=torch.int64, device=d)
         self.logits_q = torch.empty(B, self.K, self.vocab_size, dtype=self.draft_dtype, device=d)
@@ -70,15 +67,14 @@ class TargetDraftHandshake:
                 self.block_tables_buf[i, :bt_len] = torch.tensor(bt, dtype=torch.int32, device=self.device)
             self.block_tables_buf[i, bt_len:] = -1
 
-        # Send cmd + meta + fused payload
+        # Send cmd + meta + fused payload (same wire protocol as before)
         dist.send(self.cmd, dst=self.draft_runner_rank, group=self.async_pg)
         dist.send(self.meta, dst=self.draft_runner_rank, group=self.async_pg)
-        self._block_tables_int64.copy_(self.block_tables_buf)
-        self._temps_int64.copy_(self.temps_buf.view(torch.int32).to(torch.int64))
+        temps_as_int64 = self.temps_buf.view(torch.int32).to(torch.int64)
         send_int64(
             self.async_pg, self.draft_runner_rank,
             self.cache_keys, self.num_tokens_buf,
-            self._block_tables_int64, self._temps_int64,
+            self.block_tables_buf.to(torch.int64), temps_as_int64,
         )
 
         if self.eagle:
@@ -88,11 +84,9 @@ class TargetDraftHandshake:
             dist.send(recovery_activations.to(self.draft_dtype), dst=self.draft_runner_rank, group=self.async_pg)
 
         # Recv into pre-allocated buffers
-        self._skip_logits = all(seq.temperature == 0 and (seq.draft_temperature is None or seq.draft_temperature == 0) for seq in seqs)
         dist.recv(self.fused_response, src=self.draft_runner_rank, group=self.async_pg)
         cache_hits = self.fused_response[:B]
         speculations = self.fused_response[B:].view(B, self.K)
-        if not self._skip_logits:
-            dist.recv(self.logits_q, src=self.draft_runner_rank, group=self.async_pg)
+        dist.recv(self.logits_q, src=self.draft_runner_rank, group=self.async_pg)
 
         return speculations, self.logits_q, cache_hits

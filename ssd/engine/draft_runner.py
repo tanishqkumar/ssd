@@ -187,9 +187,9 @@ class DraftRunner(ModelRunner):
         # Draft model now returns full target vocab size logits (after d2t expansion)
         V = self.hf_config.vocab_size
 
-        # Pre-allocate output tensors (cache hits overwrite, JIT fills misses)
-        out_logits = torch.empty((B, K, V), dtype=self.hf_config.torch_dtype, device=self.device)
-        out_tokens = torch.zeros((B, K), dtype=torch.int64, device=self.device)
+        # Init miss slots with valid random logits so token IDs are in-vocab (fixes B>1 crash)
+        out_logits = torch.empty((B, K, V), dtype=self.hf_config.torch_dtype, device=self.device).uniform_()
+        out_tokens = out_logits.argmax(dim=-1)
         cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
         assert request_keys.shape == (B, 3), f"ERROR in hit_cache_and_respond: request_keys should be (B, 3), got {request_keys.shape}"
@@ -200,7 +200,7 @@ class DraftRunner(ModelRunner):
             dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
         
-        # Statistics (deferred sync)
+        # Statistics
         ttl += int(B)
         
         if self.config.verbose:
@@ -215,7 +215,7 @@ class DraftRunner(ModelRunner):
             eq = (request_keys.unsqueeze(1) == self.tree_cache_keys.unsqueeze(0))  # [B,T,3]
             match = torch.all(eq, dim=2)  # [B,T]
             cache_hits = match.any(dim=1)  # [B]
-            ttl_hit += int(B)  # approximate; exact count logged at end
+            ttl_hit += int(cache_hits.sum().item())
             
             if self.config.verbose:
                 print(f"[hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
@@ -358,8 +358,7 @@ class DraftRunner(ModelRunner):
         # Send response: cache_hits and spec_tokens_flat in one fused message
         fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
         dist.send(fused_response, dst=0, group=self.async_pg)
-        if (temperatures != 0).any().item():
-            dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
+        dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,  
