@@ -470,6 +470,20 @@ class DraftRunner(ModelRunner):
             B=B, 
         ) 
 
+        # Pre-compute tree decode args indices while GPU is idle (before glue decode).
+        cache_hits = partial_tree_decode_args["cache_hits"]
+        cache_hits_list = cache_hits.tolist()  # GPU sync while GPU is idle = instant
+        _pre_b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[:, None].expand(B, self.config.MQ_LEN).flatten()
+        _pre_fkp1_flat = self._arange_mq.repeat(B)
+        _pre_j_idx_flat = torch.cat([self._fan_idx_hit if int(h) else self._fan_idx_miss for h in cache_hits_list])
+        N_pre = _pre_b_flat.shape[0]
+        _pre_metadata_ints = (B, K, self.config.async_fan_out, N_pre)
+        pos_offset = -1 if self.config.use_eagle else 0
+        _pre_seq_ids_expanded = partial_tree_decode_args["seq_ids"][_pre_b_flat]
+        _pre_positions = (partial_tree_decode_args["num_tokens"][_pre_b_flat] - 1 + pos_offset) + (K + 1) + _pre_fkp1_flat
+        _pre_rope_positions = (partial_tree_decode_args["num_tokens"][_pre_b_flat] - 1 + pos_offset) + _pre_j_idx_flat + 1
+        _pre_temperatures = partial_tree_decode_args["temperatures"][_pre_b_flat]
+
         glue_hidden_states = None
         glue_prenorm = None
 
@@ -523,12 +537,12 @@ class DraftRunner(ModelRunner):
         if glue_prenorm is not None:
             glue_prenorm_reshaped = glue_prenorm.view(B, K+1, -1)
             
-            cache_hits = partial_tree_decode_args["cache_hits"]
+            # cache_hits already computed above
             fan_out_hit = self.config.fan_out_t.tolist()
             fan_out_miss = self.config.fan_out_t_miss.tolist()
             tree_hidden_states = []
             for b in range(B):
-                fan_out = fan_out_hit if bool(cache_hits[b].item()) else fan_out_miss
+                fan_out = fan_out_hit if cache_hits_list[b] else fan_out_miss
                 for depth in range(K+1):
                     reps = int(fan_out[depth])
                     if reps == 0:
@@ -538,7 +552,7 @@ class DraftRunner(ModelRunner):
             
             tree_hidden_states = torch.cat(tree_hidden_states, dim=0)
             N = sum(
-                sum(self.config.fan_out_t.tolist()) if bool(cache_hits[b].item()) else sum(self.config.fan_out_t_miss.tolist())
+                sum(self.config.fan_out_t.tolist()) if cache_hits_list[b] else sum(self.config.fan_out_t_miss.tolist())
                 for b in range(B)
             )
             assert tree_hidden_states.shape[0] == N
@@ -552,7 +566,19 @@ class DraftRunner(ModelRunner):
             tokenizer=self.tokenizer
         ).view(-1)  # [B*F*(K+1)] = [N], now [B*MQ_LEN]
 
-        tree_decode_args = self._construct_tree_decode_args(partial_tree_decode_args, forked_rec_tokens, dbt)
+        # Use pre-computed indices (computed before glue decode to overlap CPU with GPU)
+        tree_decode_args = {
+            "metadata_ints": _pre_metadata_ints,  # Python tuple (B,K,F,N), no GPU tensor
+            "input_ids": forked_rec_tokens,
+            "positions": _pre_positions,
+            "rope_positions": _pre_rope_positions,
+            "block_tables": dbt,
+            "temps": _pre_temperatures,
+            "rec_flat": forked_rec_tokens,
+            "seq_ids_expanded": _pre_seq_ids_expanded,
+            "cache_hits": cache_hits,
+            "cache_hits_list": cache_hits_list,  # Pre-computed Python list
+        }
         tree_decode_args["hidden_states"] = tree_hidden_states
         return tree_decode_args
 
@@ -600,7 +626,8 @@ class DraftRunner(ModelRunner):
         V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
         logits_flat = logits.view(-1, V)  # [N, V]
         spec_logits[:, depth, :] = logits_flat
-        next_tokens = self.sampler(logits_flat, payload["temps"], is_tree=True)
+        # Inline greedy: payload["_all_greedy"] checked once in _decode_tree
+        next_tokens = logits_flat.argmax(dim=-1) if payload["_all_greedy"] else self.sampler(logits_flat, payload["temps"], is_tree=True)
         spec_tokens[:, depth] = next_tokens
         
         return next_tokens
@@ -609,9 +636,7 @@ class DraftRunner(ModelRunner):
         """Decodes the speculation tree, checking for interrupts at each step."""
 
         # setup
-        metadata = payload["metadata"]
-        B, K, F, N = metadata[0].item(), metadata[1].item(
-        ), metadata[2].item(), metadata[3].item()
+        B, K, F, N = payload["metadata_ints"]
 
         V = self.hf_config.vocab_size  # Draft returns full target vocab size after d2t expansion
         spec_tokens = torch.zeros(
@@ -636,6 +661,7 @@ class DraftRunner(ModelRunner):
         )
 
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
+        payload["_all_greedy"] = bool((payload["temps"] == 0).all())
         for depth in range(K):
             if _prof:
                 torch.cuda.synchronize()
@@ -661,7 +687,7 @@ class DraftRunner(ModelRunner):
         # k_flat = torch.arange(self.config.speculate_k + 1, device=self.device, dtype=torch.int64)[None, :, None].expand(
         #     B, self.config.speculate_k + 1, self.config.async_fan_out).flatten()
 
-        k_flat = torch.cat([self._fan_idx_hit if hit else self._fan_idx_miss for hit in cache_hits])
+        k_flat = torch.cat([self._fan_idx_hit if hit else self._fan_idx_miss for hit in payload["cache_hits_list"]])
 
         assert k_flat.shape[0] == payload["block_tables"].shape[0] * self.config.MQ_LEN, f"ERROR in _populate_tree_cache: k_flat should be {payload['block_tables'].shape[0] * self.config.MQ_LEN}, got {k_flat.shape[0]}"
         
