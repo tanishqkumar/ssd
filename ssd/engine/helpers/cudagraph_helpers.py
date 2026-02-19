@@ -1,5 +1,6 @@
 import os
 import torch
+import numpy as np
 from typing import List
 from ssd.utils.context import set_context, get_context, reset_context
 from ssd.engine.helpers.mask_helpers import get_custom_mask
@@ -254,39 +255,101 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
                     dtype=torch.int32)
                 cache["plan_cpu_args"].append((kv_indptr_cpu, kv_lpl_cpu))
 
+        # CPU mask precompute: build all K packed masks using numpy at step 0.
+        # Eliminates per-step get_custom_mask (GPU) + segment_packbits + GPU->CPU syncs.
+        cache_hits_list = cache_hits[:B].tolist()
+
+        if "glue_hit_np" not in cache:
+            _fol = model_runner.config.fan_out_list
+            _fol_miss = model_runner.config.fan_out_list_miss
+            _tril = np.tril(np.ones((K + 1, K + 1), dtype=np.uint8))
+            cache["glue_hit_np"] = np.repeat(_tril, _fol, axis=0)
+            cache["glue_miss_np"] = np.repeat(_tril, _fol_miss, axis=0)
+
+        _glue_hit = cache["glue_hit_np"]
+        _glue_miss = cache["glue_miss_np"]
+        _rows_np = np.arange(MQ_LEN)
+
+        cache["cpu_packed_masks"] = []
+        cache["cpu_packed_indptrs"] = []
+
+        for s in range(K):
+            ttl_added_s = (s + 1) * MQ_LEN + (K + 1)
+            packed_segs = []
+            seg_packed_sizes = []
+
+            for b in range(B):
+                cols_b = int(context_lens_list[b]) + s * MQ_LEN
+                prefix_len_b = cols_b - ttl_added_s
+
+                mask_b = np.zeros((MQ_LEN, cols_b), dtype=np.uint8)
+                mask_b[:, :prefix_len_b] = 1
+                glue = _glue_hit if int(cache_hits_list[b]) == 1 else _glue_miss
+                mask_b[:, prefix_len_b:prefix_len_b + K + 1] = glue
+                diag_start = prefix_len_b + K + 1
+                for blk in range(s + 1):
+                    mask_b[_rows_np, diag_start + blk * MQ_LEN + _rows_np] = 1
+
+                packed = np.packbits(mask_b.ravel(), bitorder='little')
+                packed_segs.append(packed)
+                seg_packed_sizes.append(len(packed))
+
+            full_packed = np.concatenate(packed_segs) if B > 1 else packed_segs[0]
+            indptr = np.zeros(B + 1, dtype=np.int32)
+            indptr[1:] = np.cumsum(seg_packed_sizes)
+
+            cache["cpu_packed_masks"].append(
+                torch.from_numpy(full_packed.copy()).to(model_runner.device, non_blocking=True))
+            cache["cpu_packed_indptrs"].append(
+                torch.from_numpy(indptr.copy()).to(model_runner.device, non_blocking=True))
+
+        # Pre-transfer KV metadata to GPU (eliminates per-step pageable H2D transfers)
+        cache["qo_indptr_gpu"] = cache["cu_seqlens_q_cpu"].to(model_runner.device, non_blocking=True)
+        cache["kv_indptr_gpu"] = []
+        cache["kv_lpl_gpu"] = []
+        cache["kv_lens_gpu"] = []
+        for s in range(K):
+            ki, kl = cache["plan_cpu_args"][s]
+            cache["kv_indptr_gpu"].append(ki.to(model_runner.device, non_blocking=True))
+            cache["kv_lpl_gpu"].append(kl.to(model_runner.device, non_blocking=True))
+            kv_lens = ((ki[1:] - ki[:-1] - 1) * model_runner.block_size + kl).to(torch.int32)
+            cache["kv_lens_gpu"].append(kv_lens.to(model_runner.device, non_blocking=True))
+
     if PROFILE:
         end_time.record()
         torch.cuda.synchronize()
         precompute_time = start_time.elapsed_time(end_time)
         start_time.record()
 
-    # Sync-free plan: call C++ plan directly, skip Python plan()'s 3 GPU syncs
+    # Use precomputed CPU-packed masks (built at step 0)
     kv_indices = cache["precomputed_kv"][step]
     kv_indptr_cpu, kv_lpl_cpu = cache["plan_cpu_args"][step]
     qo_indptr_cpu = cache["cu_seqlens_q_cpu"]
 
-    custom_mask = get_custom_mask(
-        model_runner.config, context_lens, step, K, F, B,
-        device=model_runner.device, cache_hits=cache_hits)
-    mask_indptr_cpu = _compute_page_mask_indptr_cpu(
-        qo_indptr_cpu, kv_indptr_cpu, kv_lpl_cpu, model_runner.block_size)
-    packed_mask, packed_indptr_gpu = _segment_packbits_no_sync(
-        custom_mask.contiguous().view(-1), mask_indptr_cpu)
-
+    packed_mask = cache["cpu_packed_masks"][step]
+    packed_indptr = cache["cpu_packed_indptrs"][step]
     wrapper._custom_mask_buf[:len(packed_mask)].copy_(packed_mask, non_blocking=True)
-    wrapper._mask_indptr_buf.copy_(packed_indptr_gpu, non_blocking=True)
-    wrapper._qo_indptr_buf.copy_(qo_indptr_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
-    wrapper._paged_kv_indptr_buf.copy_(kv_indptr_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
-    wrapper._paged_kv_last_page_len_buf.copy_(kv_lpl_cpu.to(model_runner.device, non_blocking=True), non_blocking=True)
+    wrapper._mask_indptr_buf.copy_(packed_indptr, non_blocking=True)
+
+    # GPU-to-GPU copies from pre-transferred tensors (no pageable H2D)
+    wrapper._qo_indptr_buf.copy_(cache["qo_indptr_gpu"], non_blocking=True)
+    wrapper._paged_kv_indptr_buf.copy_(cache["kv_indptr_gpu"][step], non_blocking=True)
+    wrapper._paged_kv_last_page_len_buf.copy_(cache["kv_lpl_gpu"][step], non_blocking=True)
     wrapper._paged_kv_indices_buf[:len(kv_indices)].copy_(kv_indices, non_blocking=True)
 
-    kv_lens_cpu = ((kv_indptr_cpu[1:] - kv_indptr_cpu[:-1] - 1) * model_runner.block_size + kv_lpl_cpu).to(torch.int32)
     total_num_rows = int(qo_indptr_cpu[-1].item())
-    wrapper._kv_lens_buffer[:len(kv_lens_cpu)].copy_(kv_lens_cpu, non_blocking=True)
+    wrapper._kv_lens_buffer[:len(kv_indptr_cpu) - 1].copy_(cache["kv_lens_gpu"][step], non_blocking=True)
+
+    # Sync before plan() to prevent FlashInfer pinned buffer race condition.
+    # FlashInfer uses a single pinned CPU workspace buffer across all plan() calls.
+    # Without sync, CPU can overwrite the pinned buffer before GPU DMA reads prior step's data.
+    # BASELINE avoids this implicitly via pageable H2D copies (which sync per CUDA spec).
+    torch.cuda.synchronize()
+
     plan_args = [
         wrapper._float_workspace_buffer, wrapper._int_workspace_buffer,
         wrapper._pin_memory_int_workspace_buffer,
-        qo_indptr_cpu, kv_indptr_cpu, kv_lens_cpu,
+        qo_indptr_cpu, kv_indptr_cpu, cache["kv_lens_gpu"][step],
         wrapper._max_total_num_rows or total_num_rows,
         B, model_runner.hf_config.num_attention_heads,
         model_runner.hf_config.num_key_value_heads,
