@@ -58,39 +58,49 @@ class DraftRunner(ModelRunner):
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
 
-        # 1) Receive fused payload: metadata(5) + input_ids + positions + cu_q + cu_k + slot_map + block_tables
-        max_blocks = (self.config.max_model_len +
-                      self.block_size - 1) // self.block_size
+        # 1) Receive metadata then individual tensors
         # First recv metadata to learn sizes
         metadata = torch.zeros(5, dtype=torch.int64, device=self.device)
         dist.recv(metadata, src=0, group=self.async_pg)
-        total_new_tokens, total_slots, max_q, max_k, batch_size = metadata.tolist()
+        total_new_tokens, batch_size, max_blocks, use_eagle, eagle_act_dim = metadata.tolist()
+        if use_eagle:
+            assert eagle_act_dim == 3 * self.config.d_model_target, (
+                f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
+            )
 
-        # Recv all tensors in one fused int64 burst
-        fused_total = 2 * total_new_tokens + 2 * (batch_size + 1) + total_slots + batch_size * max_blocks
-        fused = recv_int64(self.async_pg, src=0, total_length=fused_total, device=self.device)
-        off = 0
-        input_ids = fused[off:off + total_new_tokens]; off += total_new_tokens
-        positions = fused[off:off + total_new_tokens]; off += total_new_tokens
-        cu_q = fused[off:off + batch_size + 1].to(torch.int32); off += batch_size + 1
-        cu_k = fused[off:off + batch_size + 1].to(torch.int32); off += batch_size + 1
-        slot_map = fused[off:off + total_slots].to(torch.int32); off += total_slots
-        block_tables = fused[off:off + batch_size * max_blocks].view(batch_size, max_blocks).to(torch.int32); off += batch_size * max_blocks
-        assert off == fused_total
-
-        # 4) receive eagle_acts if use_eagle
+        # 2) allocate zeros tensors of the exact same shape and device
+        input_ids = torch.zeros(
+            total_new_tokens, dtype=torch.int64, device=self.device)
+        num_tokens = torch.zeros(
+            batch_size, dtype=torch.int64, device=self.device)
+        draft_block_table = torch.zeros(
+            batch_size, max_blocks, dtype=torch.int32, device=self.device)
         eagle_acts = None
-        if self.config.use_eagle:
-            eagle_acts = torch.empty(total_new_tokens, 3 * self.config.d_model_target,
-                                     dtype=self.hf_config.torch_dtype, device=self.device)
-            dist.recv(eagle_acts, src=0, group=self.async_pg)
-            assert eagle_acts is not None, "Draft must receive eagle_acts when use_eagle is True"
+        if use_eagle:
+            eagle_acts = torch.zeros(
+                total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
+            )
+
+        # 3) receive in the exact same order:
+        for t in (input_ids, num_tokens, draft_block_table, eagle_acts):
+            if t is not None:  # in case eagle_acts is None
+                dist.recv(t, src=0, group=self.async_pg)
+
+        prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
 
         # 5) set up context exactly like prepare_prefill() does:
-        set_context(is_prefill=True, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max_q, max_seqlen_k=max_k,
-                    slot_mapping=slot_map, context_lens=None) # , block_tables=block_tables, commenting this out essentially removes prefix caching
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=prefill_ctxt["cu_seqlens_q"],
+            cu_seqlens_k=prefill_ctxt["cu_seqlens_k"],
+            max_seqlen_q=prefill_ctxt["max_seqlen_q"],
+            max_seqlen_k=prefill_ctxt["max_seqlen_k"],
+            slot_mapping=prefill_ctxt["slot_map"],
+            context_lens=None,
+        ) # , block_tables=block_tables, commenting this out essentially removes prefix caching
 
         # 6) run the draft model in prefill mode
+        positions = prefill_ctxt["positions"]
         if self.config.use_eagle:
             logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=False, hidden_states=eagle_acts)
         else:
@@ -291,8 +301,6 @@ class DraftRunner(ModelRunner):
         B, K, F = meta.tolist()
 
         # Receive all request payload in one fused int64 burst (includes temperatures)
-        max_blocks = (self.config.max_model_len +
-                      self.block_size - 1) // self.block_size
         fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
         fused_req = recv_int64(self.async_pg, src=0,
                                total_length=fused_total, device=self.device)
@@ -373,6 +381,45 @@ class DraftRunner(ModelRunner):
 
         # from now on, need to thread cache_hits through tree decode and not assume that MQ_LEN is global constant, but varies with iteration depending on prev hit/miss
         return glue_decode_input_ids, partial_tree_decode_args 
+
+    def prepare_prefill_ctxt(
+        self,
+        num_tokens: torch.Tensor,  # [B]
+        draft_block_table: torch.Tensor,  # [B, max_blocks]
+    ) -> dict:
+        """
+        Prepare context for prefill forward pass.
+        """
+        B = num_tokens.shape[0]
+        # pos_offset = -1 if self.config.use_eagle else 0
+        positions = torch.cat([
+            torch.arange(num_tokens[i], device=self.device) for i in range(B)
+        ], dim=0).to(torch.int64)
+        batch_indices = torch.cat([
+            torch.full((num_tokens[i],), i, device=self.device) for i in range(B)
+        ], dim=0).to(torch.int64)
+        cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q[1:] = torch.cumsum(num_tokens, dim=0)
+        max_seqlen_q = num_tokens.max().item()
+
+        # Calculate block indices and offsets for ALL positions
+        block_indices = (positions // self.block_size).to(torch.int64)
+        offsets = (positions % self.block_size).to(torch.int32)
+
+        # Get block IDs for each position from dbt
+        block_ids = draft_block_table[batch_indices, block_indices]
+
+        # Calculate slot_map for each position
+        slot_map = (block_ids * self.block_size + offsets).to(torch.int32)
+
+        return {
+            "positions": positions,
+            "slot_map": slot_map,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_q.clone(),
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_q,
+        }
 
     
     def prepare_glue_decode_ctxt(self, num_tokens, input_ids, dbt, B):
