@@ -68,23 +68,21 @@ class DraftRunner(ModelRunner):
                 f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
             )
 
-        # 2) allocate zeros tensors of the exact same shape and device
-        input_ids = torch.zeros(
-            total_new_tokens, dtype=torch.int64, device=self.device)
-        num_tokens = torch.zeros(
-            batch_size, dtype=torch.int64, device=self.device)
-        draft_block_table = torch.zeros(
-            batch_size, max_blocks, dtype=torch.int32, device=self.device)
+        # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
+        fused_total = total_new_tokens + batch_size + batch_size * max_blocks
+        fused = recv_int64(self.async_pg, src=0, total_length=fused_total, device=self.device)
+        off = 0
+        input_ids = fused[off:off + total_new_tokens]; off += total_new_tokens
+        num_tokens = fused[off:off + batch_size]; off += batch_size
+        draft_block_table = fused[off:off + batch_size * max_blocks].view(batch_size, max_blocks).to(torch.int32); off += batch_size * max_blocks
+        assert off == fused_total
+
         eagle_acts = None
         if use_eagle:
             eagle_acts = torch.zeros(
                 total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
             )
-
-        # 3) receive in the exact same order:
-        for t in (input_ids, num_tokens, draft_block_table, eagle_acts):
-            if t is not None:  # in case eagle_acts is None
-                dist.recv(t, src=0, group=self.async_pg)
+            dist.recv(eagle_acts, src=0, group=self.async_pg)
 
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
 
@@ -294,13 +292,12 @@ class DraftRunner(ModelRunner):
         return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits, out_activations
 
     def _service_spec_request(self):
-
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
         meta = self.recv_tensor((3,), torch.int64)
-        # not going to get any preempted or finished seqs here since we just postprocessed+scheduled before this
         B, K, F = meta.tolist()
 
-        # Receive all request payload in one fused int64 burst (includes temperatures)
+        # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
+        max_blocks = self.config.max_blocks
         fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
         fused_req = recv_int64(self.async_pg, src=0,
                                total_length=fused_total, device=self.device)
@@ -309,7 +306,6 @@ class DraftRunner(ModelRunner):
         off += 3 * B
         seq_ids = cache_keys[:, 0]
         num_tokens = fused_req[off:off + B].to(torch.int64)
-
         off += B
         draft_block_tables = fused_req[off:off + B *
                                        max_blocks].view(B, max_blocks).to(torch.int32)
@@ -325,8 +321,7 @@ class DraftRunner(ModelRunner):
 
         if self.config.use_eagle:
             dist.recv(target_recovery_activations, src=0, group=self.async_pg)
-            
-            # Print cache request details
+
             if self.config.verbose:
                 recovery_tokens_target = cache_keys[:, 2].clone()
                 print(f"\n{'='*80}", flush=True)
@@ -336,21 +331,12 @@ class DraftRunner(ModelRunner):
                     keep_idx = cache_keys[i, 1].item()
                     rec_token_target = recovery_tokens_target[i].item()
                     rec_token_text = self.tokenizer.decode([rec_token_target])
-                    
                     print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}')", flush=True)
                 print(f"{'='*80}\n", flush=True)
 
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
-            cache_keys, 
-            B, 
-            K, 
-            num_tokens, 
-            temperatures, 
-            draft_block_tables,
-            target_recovery_activations
-        )
+            cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
 
-        # Print cache response details
         if self.config.verbose:
             print(f"[CACHE RESPONSE]", flush=True)
             for i in range(B):
@@ -363,24 +349,22 @@ class DraftRunner(ModelRunner):
                     print(f"    Detokenized: {tokens_text}", flush=True)
             print(f"", flush=True)
 
-        # Send response: cache_hits and spec_tokens_flat in one fused message
         fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
         dist.send(fused_response, dst=0, group=self.async_pg)
         dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
 
         partial_tree_decode_args = {
-            "num_tokens": num_tokens,  
+            "num_tokens": num_tokens,
             "seq_ids": seq_ids,
             "temperatures": temperatures,
             "dbt": draft_block_tables,
-            "cache_hits": cache_hits, 
+            "cache_hits": cache_hits,
             "returned_tokens": out_tokens,
             "target_recovery_activations": target_recovery_activations,
             "previous_activations": out_activations,
-        } 
+        }
 
-        # from now on, need to thread cache_hits through tree decode and not assume that MQ_LEN is global constant, but varies with iteration depending on prev hit/miss
-        return glue_decode_input_ids, partial_tree_decode_args 
+        return glue_decode_input_ids, partial_tree_decode_args
 
     def prepare_prefill_ctxt(
         self,
@@ -391,15 +375,11 @@ class DraftRunner(ModelRunner):
         Prepare context for prefill forward pass.
         """
         B = num_tokens.shape[0]
-        # pos_offset = -1 if self.config.use_eagle else 0
-        positions = torch.cat([
-            torch.arange(num_tokens[i], device=self.device) for i in range(B)
-        ], dim=0).to(torch.int64)
-        batch_indices = torch.cat([
-            torch.full((num_tokens[i],), i, device=self.device) for i in range(B)
-        ], dim=0).to(torch.int64)
+        total = num_tokens.sum().item()
         cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
         cu_seqlens_q[1:] = torch.cumsum(num_tokens, dim=0)
+        batch_indices = torch.arange(B, device=self.device, dtype=torch.int64).repeat_interleave(num_tokens)
+        positions = torch.arange(total, device=self.device, dtype=torch.int64) - cu_seqlens_q[:-1].to(torch.int64).repeat_interleave(num_tokens)
         max_seqlen_q = num_tokens.max().item()
 
         # Calculate block indices and offsets for ALL positions
