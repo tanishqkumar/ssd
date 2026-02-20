@@ -25,6 +25,9 @@ from ssd.engine.helpers.cudagraph_helpers import (
 from ssd.engine.helpers.runner_helpers import (
     prepare_decode_tensors_from_seqs,
     prepare_block_tables_from_seqs,
-    prepare_prefill_tensors_from_seqs
+    prepare_prefill_tensors_from_seqs,
+    send_speculation_request,
+    receive_speculation_response,
+    prepare_prefill_payload,
+    prepare_speculation_request_payload,
 )
-from ssd.engine.helpers.handshake_helpers import TargetDraftHandshake
