@@ -3,9 +3,10 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, SpeculatorBase
-from ssd.engine.helpers.runner_helpers import prepare_prefill_payload, send_speculation_request, receive_speculation_response
+from ssd.engine.helpers.runner_helpers import prepare_prefill_payload
 from ssd.engine.sequence import Sequence
 from ssd.utils.misc import decode_tokens
+from ssd.utils.async_helpers.nccl_pack import send_int64
 
 
 class SpeculatorAsync(SpeculatorBase):
@@ -38,53 +39,70 @@ class SpeculatorAsync(SpeculatorBase):
         self.verbose = verbose
         self.K = lookahead
 
+        # Pre-allocate handshake send/recv buffers (reused every step)
+        self._alloc_handshake_bufs(1)
+
+        # Pre-allocate speculate() output buffers (avoid torch.tensor(device=cuda) sync)
+        self._recovery_buf = torch.empty(1, dtype=torch.int64, device=device)
+        self._speculations_buf = torch.empty(1, lookahead + 1, dtype=torch.int64, device=device)
+
+    def _alloc_handshake_bufs(self, B):
+        self._hs_B = B
+        d = self.device
+        self._cmd = torch.zeros(1, dtype=torch.int64, device=d)
+        self._meta = torch.tensor([B, self.K, self.async_fan_out], dtype=torch.int64, device=d)
+        self._cache_keys = torch.empty(B, 3, dtype=torch.int64, device=d)
+        self._num_tokens_buf = torch.empty(B, dtype=torch.int64, device=d)
+        self._temps_buf = torch.empty(B, dtype=torch.float32, device=d)
+        self._block_tables_buf = torch.full((B, self.max_blocks), -1, dtype=torch.int32, device=d)
+        self._fused_response = torch.empty(B + B * self.K, dtype=torch.int64, device=d)
+        self._logits_q = torch.empty(B, self.K, self.vocab_size, dtype=self.draft_dtype, device=d)
+
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
         input_id_list = [seq.token_ids for seq in seqs]
-
         max_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
         cmd, metadata, input_ids, num_tokens, draft_block_table, eagle_acts = prepare_prefill_payload(
-            input_id_list,
-            eagle_acts,
-            self.device,
-            max_blocks,
+            input_id_list, eagle_acts, self.device, max_blocks,
             [seq.draft_block_table for seq in seqs],
         )
-
         dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
         dist.send(metadata, dst=self.draft_runner_rank, group=self.async_pg)
-        for t in (input_ids, num_tokens, draft_block_table, eagle_acts):
-            if t is not None:
-                dist.send(t, dst=self.draft_runner_rank, group=self.async_pg)
-
+        send_int64(self.async_pg, self.draft_runner_rank,
+                   input_ids, num_tokens, draft_block_table.to(torch.int64))
+        if eagle_acts is not None:
+            dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
         return SpeculateResult([], [])
 
     def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         for seq in seqs:
-            if seq.recovery_token_id is None:
-                raise ValueError(
-                    f"recovery_token_id is None for seq {seq.seq_id}")
+            assert seq.recovery_token_id is not None
             seq.append_token(seq.recovery_token_id)
 
         if self.verbose:
-            sep = '=' * 80; print(f"\n{sep}", flush=True)
+            sep = '=' * 80
+            print(f"\n{sep}", flush=True)
             print(f"[TARGET SEQUENCE TRUNK] Batch size: {len(seqs)}", flush=True)
             for i, seq in enumerate(seqs):
-                trunk_tokens = seq.token_ids[-20:] if len(seq.token_ids) > 20 else seq.token_ids
-                trunk_text = decode_tokens(trunk_tokens, self.tokenizer)
-                recovery_text = decode_tokens([seq.recovery_token_id], self.tokenizer)
+                trunk = seq.token_ids[-20:] if len(seq.token_ids) > 20 else seq.token_ids
                 print(f"  Seq {seq.seq_id} (len={len(seq.token_ids)}):", flush=True)
-                print(f"    Trunk (last 20): ...{trunk_text}", flush=True)
-                print(f"    Recovery token: {seq.recovery_token_id} ({recovery_text})", flush=True)
+                print(f"    Trunk: ...{decode_tokens(trunk, self.tokenizer)}", flush=True)
+                print(f"    Recovery: {seq.recovery_token_id} ({decode_tokens([seq.recovery_token_id], self.tokenizer)})", flush=True)
             print(f"{sep}\n", flush=True)
 
         eagle = verify_result.eagle_acts is not None
-        speculations_tokens, logits_q, cache_hits = self.speculation_request(seqs, eagle)
+        speculations_tokens, logits_q, cache_hits = self._speculation_request(seqs, eagle)
 
-        recovery_tokens_tensor = torch.tensor(
-            [seq.recovery_token_id for seq in seqs], dtype=torch.int64, device=self.device)
-        speculations = torch.cat(
-            [recovery_tokens_tensor.unsqueeze(1), speculations_tokens], dim=1)
+        # Build speculations using pre-allocated buffers (avoids torch.tensor(device=cuda) sync)
+        B = len(seqs)
+        if B != self._recovery_buf.shape[0]:
+            self._recovery_buf = torch.empty(B, dtype=torch.int64, device=self.device)
+            self._speculations_buf = torch.empty(B, self.K + 1, dtype=torch.int64, device=self.device)
+        _rec_cpu = torch.tensor([seq.recovery_token_id for seq in seqs], dtype=torch.int64)
+        self._recovery_buf.copy_(_rec_cpu, non_blocking=True)
+        self._speculations_buf[:, 0] = self._recovery_buf
+        self._speculations_buf[:, 1:] = speculations_tokens
+        speculations = self._speculations_buf
 
         for i, seq in enumerate(seqs):
             seq.token_ids.extend(speculations_tokens[i].tolist())
@@ -94,27 +112,45 @@ class SpeculatorAsync(SpeculatorBase):
 
         return SpeculateResult(speculations, logits_q, cache_hits)
 
-    def speculation_request(self, seqs: list[Sequence], eagle: bool):
-        send_speculation_request(
-            seqs=seqs,
-            lookahead=self.lookahead,
-            async_fan_out=self.async_fan_out,
-            max_blocks=self.max_blocks,
-            eagle=eagle,
-            draft_dtype=self.draft_dtype,
-            device=self.device,
-            async_pg=self.async_pg,
-            draft_runner_rank=self.draft_runner_rank,
+    def _speculation_request(self, seqs: list[Sequence], eagle: bool):
+        B = len(seqs)
+        if B != self._hs_B:
+            self._alloc_handshake_bufs(B)
+
+        # Fill send buffers in-place (avoids torch.tensor from Python lists)
+        for i, seq in enumerate(seqs):
+            self._cache_keys[i, 0] = seq.seq_id
+            self._cache_keys[i, 1] = seq.last_spec_step_accepted_len - 1
+            self._cache_keys[i, 2] = seq.recovery_token_id
+            self._num_tokens_buf[i] = seq.num_tokens
+            self._temps_buf[i] = seq.draft_temperature or seq.temperature
+            bt = seq.draft_block_table
+            bt_len = len(bt)
+            if bt_len > 0:
+                self._block_tables_buf[i, :bt_len] = torch.tensor(bt, dtype=torch.int32, device=self.device)
+            self._block_tables_buf[i, bt_len:] = -1
+
+        # Send cmd + meta + fused payload (temps fused into int64 burst)
+        dist.send(self._cmd, dst=self.draft_runner_rank, group=self.async_pg)
+        dist.send(self._meta, dst=self.draft_runner_rank, group=self.async_pg)
+        temps_as_int64 = self._temps_buf.view(torch.int32).to(torch.int64)
+        send_int64(
+            self.async_pg, self.draft_runner_rank,
+            self._cache_keys, self._num_tokens_buf,
+            self._block_tables_buf.to(torch.int64), temps_as_int64,
         )
 
-        speculations, logits_q, cache_hits = receive_speculation_response(
-            batch_size=len(seqs),
-            lookahead=self.lookahead,
-            vocab_size=self.vocab_size,
-            draft_dtype=self.draft_dtype,
-            device=self.device,
-            async_pg=self.async_pg,
-            draft_runner_rank=self.draft_runner_rank,
-        )
+        if eagle:
+            recovery_activations = torch.stack(
+                [seq.last_target_hidden_state for seq in seqs], dim=0,
+            ).to(self.device)
+            dist.send(recovery_activations.to(self.draft_dtype),
+                      dst=self.draft_runner_rank, group=self.async_pg)
 
-        return speculations, logits_q, cache_hits
+        # Recv into pre-allocated buffers
+        dist.recv(self._fused_response, src=self.draft_runner_rank, group=self.async_pg)
+        cache_hits = self._fused_response[:B]
+        speculations = self._fused_response[B:].view(B, self.K)
+        dist.recv(self._logits_q, src=self.draft_runner_rank, group=self.async_pg)
+
+        return speculations, self._logits_q, cache_hits
