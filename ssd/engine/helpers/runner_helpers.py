@@ -230,7 +230,7 @@ def prepare_decode_tensors_from_seqs(
             pos0 = seq.num_tokens - (k+1)
             input_ids.extend(seq[pos0:])
             positions.extend(list(range(pos0, pos0 + k + 1)))
-            assert seq.num_cached_tokens == pos0, "num_cached_tokens should be equal to len(seq)-(k+1)" 
+            assert seq.num_cached_tokens == pos0, f"num_cached_tokens={seq.num_cached_tokens} != pos0={pos0} (num_tokens={seq.num_tokens}, k={k})"
             context_lens.append(len(seq))  
 
             for j in range(k + 1):
