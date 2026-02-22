@@ -140,6 +140,10 @@ class Scheduler:
         seq.num_prompt_tokens = seq.num_tokens
         # reinit like it's new, this can be a flag for "am on first spec step"
         seq.last_spec_step_accepted_len = -1
+        # Clear extend data so re-prefilled seq doesn't send stale extend to draft
+        seq.extend_count = 0
+        seq.extend_eagle_acts = None
+        seq.extend_token_ids = None
 
     # non-speculative path, should handle completing a block here as well 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -301,6 +305,19 @@ class Scheduler:
                 accepted_len = len(new_suffix)
                 idx = min(accepted_len - 1, eagle_acts.shape[1] - 1)
                 seq.last_target_hidden_state = eagle_acts[i, idx]
+
+                # Store extend data for next glue decode
+                # new_suffix = [recovery, spec_0, ..., spec_{n-1}]
+                # n_ext = number of accepted SPEC tokens (not counting recovery)
+                n_ext = min(accepted_len - 1, self.K)
+                seq.extend_count = n_ext
+                if n_ext > 0:
+                    seq.extend_eagle_acts = eagle_acts[i, :n_ext].clone()
+                    seq.extend_token_ids = torch.tensor(
+                        new_suffix[1:1+n_ext], dtype=torch.int64, device=eagle_acts.device)
+                else:
+                    seq.extend_eagle_acts = None
+                    seq.extend_token_ids = None
 
             if finished:
                 if __debug__: print(f'Sequence {seq.seq_id} finished, deallocating and marking as done + removing from running', flush=True)

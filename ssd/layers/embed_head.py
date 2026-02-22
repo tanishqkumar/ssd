@@ -92,11 +92,6 @@ class ParallelLMHead(VocabParallelEmbedding):
                         flat_logits = torch.cat(parts, dim=-1) if self.tp_rank == 0 else None
                     return flat_logits
             else: # multi-query decode path (glue, verify, tree)
-                # assume constant query len and reshape
-                batch_size = context.cu_seqlens_q.size(0) - 1
-                constant_query_len = context.cu_seqlens_q[1] 
-                
-                # compute flat logits for every new token
                 flat_logits = F.linear(x, self.weight)
                 if self.tp_size > 1:
                     parts = [torch.empty_like(flat_logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
@@ -104,9 +99,13 @@ class ParallelLMHead(VocabParallelEmbedding):
                     flat_logits = torch.cat(parts, dim=-1) if self.tp_rank == 0 else None
                 if flat_logits is None:
                     return None
-                vocab_size = flat_logits.size(-1)
-                # reshape from [batch_size * q_len, vocab_size] to [batch_size, q_len, vocab_size]
-                return flat_logits.view(batch_size, constant_query_len, vocab_size)
+                # Check if constant query len (verify/tree) or variable (glue)
+                batch_size = context.cu_seqlens_q.size(0) - 1
+                total_tokens = x.size(0)
+                if total_tokens % batch_size == 0:
+                    constant_query_len = total_tokens // batch_size
+                    return flat_logits.view(batch_size, constant_query_len, flat_logits.size(-1))
+                return flat_logits  # variable-length: return flat [N, V]
 
         # decode, get single token 
         logits = F.linear(x, self.weight)

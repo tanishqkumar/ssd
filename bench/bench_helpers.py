@@ -183,7 +183,7 @@ def load_dataset_token_ids(
                 text: str = data["text"]
                 if use_chat_template and hasattr(tokenizer, 'apply_chat_template'):
                     tokens = tokenizer.apply_chat_template(
-                        [{"role": "user", "content": text}],
+                        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
                         add_generation_prompt=True,
                     )
                 else:
@@ -266,7 +266,7 @@ def generate_benchmark_inputs(
             args.input_len)] for _ in range(args.numseqs)]
         return None, prompt_token_ids, None
 
-    use_chat_template = getattr(args, "chat_template", False)
+    use_chat_template = getattr(args, "chat_template", False) or getattr(args, "eagle", False)
 
     if getattr(args, "all", False):
         token_ids = load_all_dataset_token_ids(

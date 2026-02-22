@@ -24,7 +24,7 @@ class DraftRunner(ModelRunner):
             gpu_memory_utilization = (0.75 if not cfg.draft_async else 0.8), # REMAINING SPACE if not draft_async
             tokenizer_path=cfg.model if cfg.use_eagle else None,
             d_model_target=cfg.hf_config.hidden_size if cfg.use_eagle and cfg.hf_config else None,
-            enforce_eager=True if cfg.use_eagle else cfg.enforce_eager,
+            enforce_eager=cfg.enforce_eager,
         )
         return draft_cfg
 
@@ -100,7 +100,7 @@ class DraftRunner(ModelRunner):
         # 6) run the draft model in prefill mode
         positions = prefill_ctxt["positions"]
         if self.config.use_eagle:
-            logits, prenorm = self.run_model(input_ids, positions, is_prefill=True, last_only=False, hidden_states=eagle_acts)
+            self.run_model(input_ids, positions, is_prefill=True, last_only=True, hidden_states=eagle_acts)
         else:
             self.run_model(input_ids, positions, is_prefill=True, last_only=True, hidden_states=eagle_acts)
 
@@ -126,6 +126,7 @@ class DraftRunner(ModelRunner):
         self._fan_idx_miss = torch.arange(K + 1, device=d, dtype=torch.int64).repeat_interleave(self.config.fan_out_t_miss)
         self._arange_mq = torch.arange(MQ_LEN, device=d, dtype=torch.int64)
         self._arange_kp1 = torch.arange(K + 1, device=d, dtype=torch.int64)
+        self._arange_2kp1 = torch.arange(2 * K + 1, device=d, dtype=torch.int64)
 
     def jit_speculate(self, 
                       request_keys: torch.Tensor, 
@@ -151,7 +152,7 @@ class DraftRunner(ModelRunner):
         
         if self.config.use_eagle:
             assert target_recovery_activations is not None
-            hidden_states = self.model.fc(target_recovery_activations)
+            hidden_states = self.model.fc(target_recovery_activations.to(self.model.fc.weight.dtype))
             spec_activations = torch.empty(
                 input_ids.shape[0], self.config.speculate_k,
                 self.hf_config.hidden_size,
@@ -319,8 +320,21 @@ class DraftRunner(ModelRunner):
             B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
 
+        extend_counts = None
+        extend_eagle_acts = None
+        extend_token_ids = None
+
         if self.config.use_eagle:
             dist.recv(target_recovery_activations, src=0, group=self.async_pg)
+
+            # Receive extend data for fused glue decode
+            act_dim = 3 * self.config.d_model_target
+            extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
+            extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.hf_config.torch_dtype, device=self.device)
+            extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
+            dist.recv(extend_counts, src=0, group=self.async_pg)
+            dist.recv(extend_eagle_acts, src=0, group=self.async_pg)
+            dist.recv(extend_token_ids, src=0, group=self.async_pg)
 
             if self.config.verbose:
                 recovery_tokens_target = cache_keys[:, 2].clone()
@@ -331,7 +345,8 @@ class DraftRunner(ModelRunner):
                     keep_idx = cache_keys[i, 1].item()
                     rec_token_target = recovery_tokens_target[i].item()
                     rec_token_text = self.tokenizer.decode([rec_token_target])
-                    print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}')", flush=True)
+                    n_ext = extend_counts[i].item()
+                    print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
                 print(f"{'='*80}\n", flush=True)
 
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
@@ -362,6 +377,9 @@ class DraftRunner(ModelRunner):
             "returned_tokens": out_tokens,
             "target_recovery_activations": target_recovery_activations,
             "previous_activations": out_activations,
+            "extend_counts": extend_counts,
+            "extend_eagle_acts": extend_eagle_acts,
+            "extend_token_ids": extend_token_ids,
         }
 
         return glue_decode_input_ids, partial_tree_decode_args
@@ -438,6 +456,44 @@ class DraftRunner(ModelRunner):
             "block_tables": dbt,
         }
 
+    def prepare_glue_decode_ctxt_eagle(self, num_tokens, fused_ids, fused_hs, extend_counts, seqlens_q, cu_seqlens_q, dbt, B):
+        """Prepare context for EAGLE glue decode with FA varlen causal.
+
+        Tokens packed contiguously: [ext_0..ext_{n0-1}, rec_0, spec_0..spec_{K-1}, ext_1..., ...]
+        No padding within sequences. cu_seqlens_q has variable per-seq lengths.
+        """
+        K = self.config.speculate_k
+        total_real = int(cu_seqlens_q[-1].item())
+
+        # Per-token batch index and local offset within each seq
+        batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device), seqlens_q)  # [total_real]
+        local_off = torch.arange(total_real, device=self.device) - cu_seqlens_q[:-1].long().repeat_interleave(seqlens_q)
+
+        # Positions: extend starts at num_tokens-2-n_ext, then rec, then spec
+        # base_pos[b] = num_tokens[b] - 2 - extend_counts[b] (position of first extend token)
+        base_pos = (num_tokens - 2 - extend_counts).long()  # [B]
+        positions = (base_pos[batch_idx] + local_off).to(torch.int64)
+
+        # Context lens: last token (spec K-1) at pos num_tokens-2+K, cache has 0..num_tokens-2+K
+        context_lens = (num_tokens - 1 + K).to(torch.int32)
+
+        # Slot mapping
+        block_idx = (positions // self.block_size).clamp(0, dbt.shape[1] - 1).to(torch.int64)
+        block_off = (positions % self.block_size).to(torch.int32)
+        blk_ids = dbt[batch_idx, block_idx]
+        slot_map = (blk_ids * self.block_size + block_off).to(torch.int32)
+
+        return {
+            "input_ids": fused_ids,
+            "positions": positions,
+            "slot_map": slot_map,
+            "hidden_states": fused_hs,
+            "cu_seqlens_q": cu_seqlens_q,
+            "max_seqlen_q": 2 * K + 1,
+            "context_lens": context_lens,
+            "block_tables": dbt,
+        }
+
     def _construct_tree_decode_args(self, partial_tree_decode_args, rec_flat, dbt):
         # tree decode needs (input_ids, positions) that are [N], wrapper plan handles batch size of attn computation 
         # rec_flat is [N]
@@ -479,123 +535,175 @@ class DraftRunner(ModelRunner):
         return tree_decode_args
 
     def _build_tree_batch(self, partial_tree_decode_args, glue_decode_input_ids):
-        if self.config.verbose: 
+        if self.config.verbose:
             print(f'about to build tree batch')
         K = self.config.speculate_k
-        B = glue_decode_input_ids.shape[0] // (K + 1)
-
-        assert B == partial_tree_decode_args["num_tokens"].shape[
-            0], "ERROR in _build_tree_batch: B should be the same as the number of tokens"
-
-        # Prepare context for glue decode
         dbt = partial_tree_decode_args["dbt"]
-        
-        glue_decode_ctxt = self.prepare_glue_decode_ctxt(
-            num_tokens=partial_tree_decode_args["num_tokens"],
-            input_ids=glue_decode_input_ids,
-            dbt=dbt,
-            B=B, 
-        ) 
-
-        # Pre-compute tree decode args indices while GPU is idle (before glue decode).
         cache_hits = partial_tree_decode_args["cache_hits"]
-        cache_hits_list = cache_hits.tolist()  # GPU sync while GPU is idle = instant
+        cache_hits_list = cache_hits.tolist()
+        pos_offset = -1 if self.config.use_eagle else 0
+
+        if self.config.use_eagle:
+            B = partial_tree_decode_args["num_tokens"].shape[0]
+            extend_counts = partial_tree_decode_args.get("extend_counts")
+            if extend_counts is None:
+                extend_counts = torch.zeros(B, dtype=torch.int64, device=self.device)
+            extend_eagle_acts_batch = partial_tree_decode_args.get("extend_eagle_acts")
+            extend_token_ids_batch = partial_tree_decode_args.get("extend_token_ids")
+            target_acts = partial_tree_decode_args["target_recovery_activations"]
+            prev_acts = partial_tree_decode_args["previous_activations"]
+            hidden_size = self.hf_config.hidden_size
+            fc_dtype = self.model.fc.weight.dtype
+
+            gd_view = glue_decode_input_ids.view(B, K + 1)
+            rec_tok_ids = gd_view[:, 0]
+            spec_tok_ids = gd_view[:, 1:]
+
+            # Variable per-seq lengths: n_ext[b] + K + 1
+            seqlens_q = (extend_counts + K + 1).to(torch.int32)
+            cu_seqlens_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+            cu_seqlens_q[1:] = torch.cumsum(seqlens_q, 0)
+            total_real = int(cu_seqlens_q[-1].item())
+
+            # Build packed fused_ids and fused_hs (no padding, no for loops)
+            fused_ids = torch.zeros(total_real, dtype=torch.int64, device=self.device)
+            fused_hs = torch.zeros(total_real, hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+
+            # Per-token batch index and local offset
+            batch_idx = torch.repeat_interleave(torch.arange(B, device=self.device), seqlens_q)
+            local_off = torch.arange(total_real, device=self.device) - cu_seqlens_q[:-1].long().repeat_interleave(seqlens_q)
+            n_ext = extend_counts.long()  # [B]
+            n_ext_per_tok = n_ext[batch_idx]  # [total_real]
+
+            # Classify each token: extend (local < n_ext), rec (local == n_ext), spec (local > n_ext)
+            is_extend = local_off < n_ext_per_tok
+            is_rec = local_off == n_ext_per_tok
+            is_spec = local_off > n_ext_per_tok
+
+            # Extend + rec tokens: batch fc into single call
+            is_target_conditioned = is_extend | is_rec
+            tc_b = batch_idx[is_target_conditioned]
+            tc_local = local_off[is_target_conditioned]
+            tc_n_ext = n_ext_per_tok[is_target_conditioned]
+
+            # Gather target acts: extend uses extend_eagle_acts_batch[b,j], rec uses target_acts[b]
+            tc_is_ext = tc_local < tc_n_ext
+            tc_acts = torch.empty(tc_b.size(0), target_acts.size(1), dtype=fc_dtype, device=self.device)
+            if tc_is_ext.any() and extend_eagle_acts_batch is not None:
+                ext_b = tc_b[tc_is_ext]
+                ext_j = tc_local[tc_is_ext]
+                tc_acts[tc_is_ext] = extend_eagle_acts_batch[ext_b, ext_j].to(fc_dtype)
+                fused_ids[is_extend] = extend_token_ids_batch[ext_b, ext_j]
+            tc_acts[~tc_is_ext] = target_acts[tc_b[~tc_is_ext]].to(fc_dtype)
+            fused_ids[is_rec] = rec_tok_ids[batch_idx[is_rec]]
+
+            # Single batched fc call
+            fused_hs[is_target_conditioned] = self.model.fc(tc_acts)
+
+            # Spec tokens: ids from spec_tok_ids, hs from prev_acts (self-conditioned, no fc)
+            spec_j = local_off[is_spec] - n_ext_per_tok[is_spec] - 1  # 0..K-1
+            fused_ids[is_spec] = spec_tok_ids[batch_idx[is_spec], spec_j]
+            fused_hs[is_spec] = prev_acts[batch_idx[is_spec], spec_j]
+
+            glue_decode_ctxt = self.prepare_glue_decode_ctxt_eagle(
+                num_tokens=partial_tree_decode_args["num_tokens"],
+                fused_ids=fused_ids, fused_hs=fused_hs,
+                extend_counts=extend_counts, seqlens_q=seqlens_q,
+                cu_seqlens_q=cu_seqlens_q, dbt=dbt, B=B,
+            )
+        else:
+            # Non-EAGLE: K+1 per seq, uses verify CG path
+            B = glue_decode_input_ids.shape[0] // (K + 1)
+            assert B == partial_tree_decode_args["num_tokens"].shape[0]
+            glue_decode_ctxt = self.prepare_glue_decode_ctxt(
+                num_tokens=partial_tree_decode_args["num_tokens"],
+                input_ids=glue_decode_input_ids,
+                dbt=dbt, B=B,
+            )
+
+        # Pre-compute tree decode args (overlap CPU with GPU)
         _pre_b_flat = torch.arange(B, device=self.device, dtype=torch.int64)[:, None].expand(B, self.config.MQ_LEN).flatten()
         _pre_fkp1_flat = self._arange_mq.repeat(B)
         _pre_j_idx_flat = torch.cat([self._fan_idx_hit if int(h) else self._fan_idx_miss for h in cache_hits_list])
         N_pre = _pre_b_flat.shape[0]
         _pre_metadata_ints = (B, K, self.config.async_fan_out, N_pre)
-        pos_offset = -1 if self.config.use_eagle else 0
         _pre_seq_ids_expanded = partial_tree_decode_args["seq_ids"][_pre_b_flat]
         _pre_positions = (partial_tree_decode_args["num_tokens"][_pre_b_flat] - 1 + pos_offset) + (K + 1) + _pre_fkp1_flat
         _pre_rope_positions = (partial_tree_decode_args["num_tokens"][_pre_b_flat] - 1 + pos_offset) + _pre_j_idx_flat + 1
         _pre_temperatures = partial_tree_decode_args["temperatures"][_pre_b_flat]
 
-        glue_hidden_states = None
-        glue_prenorm = None
-
-        if self.config.use_eagle:
-            hidden_size = self.hf_config.hidden_size
-            target_acts = partial_tree_decode_args["target_recovery_activations"]
-            prev_acts = partial_tree_decode_args["previous_activations"]
-            assert target_acts is not None
-            assert prev_acts is not None, "prev_acts must be provided when use_eagle is True"
-            
-            glue_hidden_states = torch.empty(B * (K+1), hidden_size,
-                                             dtype=self.hf_config.torch_dtype, device=self.device)
-    
-            
-            glue_hs_view = glue_hidden_states.view(B, K+1, -1)
-            glue_hs_view[:, 0, :] = self.model.fc(target_acts)
-            glue_hs_view[:, 1:, :] = prev_acts
-
+        # --- Run glue decode forward ---
         set_context(
             is_prefill=False,
             cu_seqlens_q=glue_decode_ctxt["cu_seqlens_q"],
-            max_seqlen_q=glue_decode_ctxt["max_seqlen_q"], 
+            max_seqlen_q=glue_decode_ctxt["max_seqlen_q"],
             slot_mapping=glue_decode_ctxt["slot_map"],
             context_lens=glue_decode_ctxt["context_lens"],
-            block_tables=glue_decode_ctxt["block_tables"]
+            block_tables=glue_decode_ctxt["block_tables"],
         )
 
+        glue_prenorm = None
         if self.config.use_eagle:
-            if self.config.verbose:
-                print(f'[_build_tree_batch EAGLE] calling run_model with:')
-                print(f'  input_ids.shape={glue_decode_ctxt["input_ids"].shape}')
-                print(f'  positions.shape={glue_decode_ctxt["positions"].shape}')
-                print(f'  hidden_states.shape={glue_hidden_states.shape}')
-            
+            fused_hs_flat = glue_decode_ctxt["hidden_states"]
             glue_decode_logits_flat, glue_prenorm = self.run_model(
-                glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"], 
-                is_prefill=False, last_only=False, hidden_states=glue_hidden_states)
-            
-            if self.config.verbose:
-                print(f'[_build_tree_batch EAGLE] run_model returned:')
-                print(f'  glue_decode_logits_flat.shape={glue_decode_logits_flat.shape}')
-                print(f'  glue_prenorm.shape={glue_prenorm.shape}')
+                glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"],
+                is_prefill=False, last_only=False, hidden_states=fused_hs_flat)
         else:
             glue_decode_logits_flat = self.run_model(
-                glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"], 
+                glue_decode_ctxt["input_ids"], glue_decode_ctxt["positions"],
                 is_prefill=False, last_only=False)
-            
+
         reset_context()
-    
+
+        # --- Extract K+1 logits/prenorms at rec+spec positions ---
+        if self.config.use_eagle:
+            # Packed layout: rec at cu_seqlens_q[b] + n_ext[b], spec follows
+            cu_q = glue_decode_ctxt["cu_seqlens_q"]
+            rec_offsets = cu_q[:-1].long() + extend_counts.long()  # [B]
+            extract_idx = rec_offsets.unsqueeze(1) + self._arange_kp1.unsqueeze(0)  # [B, K+1]
+            flat_idx = extract_idx.flatten()
+            glue_decode_logits = glue_decode_logits_flat[flat_idx].view(B, K + 1, -1)
+            if glue_prenorm is not None:
+                glue_prenorm_kp1 = glue_prenorm[flat_idx].view(B, K + 1, -1)
+        else:
+            glue_decode_logits = glue_decode_logits_flat.view(B, K + 1, -1)
+            if glue_prenorm is not None:
+                glue_prenorm_kp1 = glue_prenorm.view(B, K + 1, -1)
+
+        # --- Build tree hidden states from K+1 prenorms ---
         tree_hidden_states = None
         if glue_prenorm is not None:
-            glue_prenorm_reshaped = glue_prenorm.view(B, K+1, -1)
-            
-            # cache_hits already computed above
-            fan_out_hit = self.config.fan_out_t.tolist()
-            fan_out_miss = self.config.fan_out_t_miss.tolist()
-            tree_hidden_states = []
-            for b in range(B):
-                fan_out = fan_out_hit if cache_hits_list[b] else fan_out_miss
-                for depth in range(K+1):
-                    reps = int(fan_out[depth])
-                    if reps == 0:
-                        continue
-                    act = glue_prenorm_reshaped[b, depth].unsqueeze(0)
-                    tree_hidden_states.append(act.repeat(reps, 1))
-            
-            tree_hidden_states = torch.cat(tree_hidden_states, dim=0)
-            N = sum(
-                sum(self.config.fan_out_t.tolist()) if cache_hits_list[b] else sum(self.config.fan_out_t_miss.tolist())
-                for b in range(B)
-            )
-            assert tree_hidden_states.shape[0] == N
-    
-        glue_decode_logits = glue_decode_logits_flat.view(B, K+1, -1) # [B, K+1, V]
+            # Vectorized: for each (b, depth), repeat prenorm by fan_out[depth]
+            # fan_out_t[depth] for hits, fan_out_t_miss[depth] for misses
+            fan_hit = self.config.fan_out_t  # [K+1]
+            fan_miss = self.config.fan_out_t_miss  # [K+1]
+            # Per-batch fan_out: [B, K+1]
+            per_batch_fan = torch.where(
+                cache_hits.bool().unsqueeze(1).expand(B, K + 1),
+                fan_hit.unsqueeze(0).expand(B, K + 1),
+                fan_miss.unsqueeze(0).expand(B, K + 1),
+            )  # [B, K+1]
+            reps_flat = per_batch_fan.reshape(-1)  # [B*(K+1)]
+            prenorms_flat = glue_prenorm_kp1.reshape(B * (K + 1), -1)  # [B*(K+1), d]
+            tree_hidden_states = torch.repeat_interleave(prenorms_flat, reps_flat, dim=0)
+
+        # --- Fork tokens from K+1 logits ---
+        # Need [B, K+1] input_ids for forking (rec + spec tokens)
+        if self.config.use_eagle:
+            gd_for_fork = gd_view  # [B, K+1] already computed above
+        else:
+            gd_for_fork = glue_decode_input_ids.reshape(B, K + 1)
+
         forked_rec_tokens = get_forked_recovery_tokens_from_logits(
             self.config,
             glue_decode_logits,
-            partial_tree_decode_args["cache_hits"],
-            glue_decode_input_ids.reshape(B, K+1), # [B, K+1], we set probs of these to 0 when forking to avoid forking them 
-            tokenizer=self.tokenizer
-        ).view(-1)  # [B*F*(K+1)] = [N], now [B*MQ_LEN]
+            cache_hits,
+            gd_for_fork,
+            tokenizer=self.tokenizer,
+        ).view(-1)
 
-        # Use pre-computed indices (computed before glue decode to overlap CPU with GPU)
         tree_decode_args = {
-            "metadata_ints": _pre_metadata_ints,  # Python tuple (B,K,F,N), no GPU tensor
+            "metadata_ints": _pre_metadata_ints,
             "input_ids": forked_rec_tokens,
             "positions": _pre_positions,
             "rope_positions": _pre_rope_positions,
@@ -604,7 +712,7 @@ class DraftRunner(ModelRunner):
             "rec_flat": forked_rec_tokens,
             "seq_ids_expanded": _pre_seq_ids_expanded,
             "cache_hits": cache_hits,
-            "cache_hits_list": cache_hits_list,  # Pre-computed Python list
+            "cache_hits_list": cache_hits_list,
         }
         tree_decode_args["hidden_states"] = tree_hidden_states
         return tree_decode_args
