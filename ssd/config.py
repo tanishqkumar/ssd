@@ -7,8 +7,8 @@ import torch
 class Config:
     model: str = "/data/shared/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
     max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 1 
-    max_model_len: int = 4096 
+    max_num_seqs: int = 1
+    max_model_len: int = 4096
     gpu_memory_utilization: float = 0.7
     num_gpus: int = 1
     enforce_eager: bool = False
@@ -49,17 +49,26 @@ class Config:
 
     def __post_init__(self):
         model = self.model 
-        assert os.path.isdir(model)
+        # assert os.path.isdir(model)
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
         self.hf_config = AutoConfig.from_pretrained(model)
-        self.max_model_len = min(
-            self.max_model_len, self.hf_config.max_position_embeddings) 
-        if self.speculate: 
+
+        if not self.speculate:
+            if self.max_model_len:
+                self.max_model_len = min(
+                    self.max_model_len, self.hf_config.max_position_embeddings)
+            else:
+                self.max_model_len = self.hf_config.max_position_embeddings
+        else:
             draft = self.draft
             self.draft_hf_config = AutoConfig.from_pretrained(draft)
-            self.max_model_len = min(
-                self.max_model_len, self.draft_hf_config.max_position_embeddings)
+            if self.max_model_len:
+                self.max_model_len = min(
+                    self.max_model_len, self.draft_hf_config.max_position_embeddings)
+            else:
+                self.max_model_len = self.draft_hf_config.max_position_embeddings
+
             if self.draft_async:
                 if self.fan_out_list is None: 
                     self.fan_out_list = [self.async_fan_out] * (self.speculate_k + 1)
@@ -90,4 +99,7 @@ class Config:
                     print(f'[Config] Overriding eagle draft max_position_embeddings: {draft_max_pos} -> {target_max_pos}', flush=True)
                     self.draft_hf_config.max_position_embeddings = target_max_pos
         
-        assert self.max_num_batched_tokens >= self.max_model_len
+        # assert self.max_num_batched_tokens >= self.max_model_len
+        if self.max_num_batched_tokens < self.max_model_len:
+            print(f'[Config] Warning: max_num_batched_tokens ({self.max_num_batched_tokens}) is less than max_model_len ({self.max_model_len})', flush=True)
+            self.max_num_batched_tokens = self.max_model_len

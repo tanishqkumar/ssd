@@ -28,8 +28,8 @@ class DraftRunner(ModelRunner):
         )
         return draft_cfg
 
-    def __init__(self, cfg: Config, rank: int = 0, init_q = None):
-        self.draft_cfg = self.create_draft_config(cfg)
+    def __init__(self, draft_cfg: Config, rank: int = 0, init_q = None):
+        self.draft_cfg = draft_cfg
         self.is_draft = True # this is is_draft, use self.config.draft for the draft model path 
         self.prev_num_tokens = None
         super().__init__(self.draft_cfg, rank=rank, event=None, is_draft=True, num_tp_gpus=1, init_q=init_q)
