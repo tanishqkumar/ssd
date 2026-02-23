@@ -83,7 +83,12 @@ class LLMEngine:
             init_q = ctx.Queue()
             draft_rank = config.num_gpus - 1
             self.draft_ps = ctx.Process(
-                target=DraftRunner, args=(config, draft_rank, init_q))
+                target=DraftRunner, args=(
+                    DraftRunner.create_draft_config(config),
+                    draft_rank,
+                    init_q,
+                ),
+            )
             self.draft_ps.start()
             print(
                 f'Draft runner created on rank {draft_rank} (async)!', flush=True)
