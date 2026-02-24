@@ -251,3 +251,5 @@ def get_custom_mask(config, context_lens, step: int, K: int, F: int, B: int, dev
         return get_custom_mask_cached(config, context_lens, step, K, F, B, device, fan_out_list=config.fan_out_list, fan_out_list_miss=config.fan_out_list_miss, cache_hits=cache_hits)
     else:
         return get_custom_mask_vectorized(config, context_lens, step, K, B, device, cache_hits)
+
+

@@ -57,10 +57,25 @@ class SpeculatorAsync(SpeculatorBase):
         self._block_tables_buf = torch.full((B, self.max_blocks), -1, dtype=torch.int32, device=d)
         self._fused_response = torch.empty(B + B * self.K, dtype=torch.int64, device=d)
         self._logits_q = torch.empty(B, self.K, self.vocab_size, dtype=self.draft_dtype, device=d)
+        self._extend_counts = torch.zeros(B, dtype=torch.int64, device=d)
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
         eagle_acts = verify_result.eagle_acts
         input_id_list = [seq.token_ids for seq in seqs]
+
+        # EAGLE token-conditioning shift: token at position j gets conditioning
+        # from target act at position j-1. Skip first token per seq and drop
+        # last eagle_act per seq so they align correctly.
+        if eagle_acts is not None:
+            sliced = []
+            offset = 0
+            for ids in input_id_list:
+                seq_len = len(ids)
+                sliced.append(eagle_acts[offset:offset + seq_len - 1])
+                offset += seq_len
+            eagle_acts = torch.cat(sliced, dim=0)
+            input_id_list = [ids[1:] for ids in input_id_list]
+
         max_blocks = (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
         cmd, metadata, input_ids, num_tokens, draft_block_table, eagle_acts = prepare_prefill_payload(
             input_id_list, eagle_acts, self.device, max_blocks,
@@ -146,6 +161,22 @@ class SpeculatorAsync(SpeculatorBase):
             ).to(self.device)
             dist.send(recovery_activations.to(self.draft_dtype),
                       dst=self.draft_runner_rank, group=self.async_pg)
+
+            # Send extend data for glue decode with fused extend
+            K = self.K
+            act_dim = recovery_activations.shape[-1]
+            for i, seq in enumerate(seqs):
+                self._extend_counts[i] = seq.extend_count
+            extend_eagle_acts = torch.zeros(B, K, act_dim, dtype=self.draft_dtype, device=self.device)
+            extend_token_ids = torch.zeros(B, K, dtype=torch.int64, device=self.device)
+            for i, seq in enumerate(seqs):
+                n = seq.extend_count
+                if n > 0 and seq.extend_eagle_acts is not None:
+                    extend_eagle_acts[i, :n] = seq.extend_eagle_acts[:n].to(self.draft_dtype)
+                    extend_token_ids[i, :n] = seq.extend_token_ids[:n]
+            dist.send(self._extend_counts, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(extend_eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(extend_token_ids, dst=self.draft_runner_rank, group=self.async_pg)
 
         # Recv into pre-allocated buffers
         dist.recv(self._fused_response, src=self.draft_runner_rank, group=self.async_pg)

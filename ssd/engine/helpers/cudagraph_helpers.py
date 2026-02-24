@@ -92,11 +92,27 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     if block_tables is not None:
         graph_vars["block_tables"][:bs, :block_tables.size(1)] = block_tables
 
-    graph.replay() # [1.35ms/1.85ms]
+    _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1"
+    if _pt:
+        torch.cuda.synchronize()
+        _t0 = perf_counter()
+
+    graph.replay()
+
+    if _pt:
+        torch.cuda.synchronize()
+        _t1 = perf_counter()
 
     # Extract outputs for the ORIGINAL batch size only
     outputs = graph_vars["outputs"][:orig_bs * k_plus_1]
     logits = model_runner.model.compute_logits(outputs, last_only)
+
+    if _pt:
+        torch.cuda.synchronize()
+        _t2 = perf_counter()
+        has_eagle = "eagle_acts" in graph_vars
+        print(f"[PROFILE verify_cg] replay={(_t1-_t0)*1000:.2f}ms logits={(_t2-_t1)*1000:.2f}ms eagle={has_eagle} bs={orig_bs} rank={model_runner.rank}", flush=True)
+
     # For eagle target, also return eagle_acts
     if "eagle_acts" in graph_vars:
         eagle_acts = graph_vars["eagle_acts"][:orig_bs * k_plus_1]
@@ -105,7 +121,7 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
 
 
 @torch.inference_mode()
-def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars):
+def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, hidden_states=None):
     context = get_context()
 
     flat_batch_size = input_ids.size(0)
@@ -122,27 +138,50 @@ def run_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     graph_vars["slot_mapping"][:flat_batch_size] = context.slot_mapping
     graph_vars["context_lens"][:flat_batch_size] = context.context_lens
 
+    if hidden_states is not None and "hidden_states" in graph_vars:
+        graph_vars["hidden_states"][:flat_batch_size] = hidden_states
+
     if context.block_tables is not None:
         graph_vars["block_tables"][:flat_batch_size,
                                 :context.block_tables.size(1)] = context.block_tables
 
-    graph.replay() # 32b is 23ms, 0.6b is 1.6ms [qwen, tp=1]. 10ms on tp=4.
-
+    graph.replay()
 
     outputs = graph_vars["outputs"][:flat_batch_size]
-    if getattr(model_runner.config, 'verbose', False):
-        print(f"[run_decode_cudagraph] outputs={tuple(outputs.shape)}", flush=True)
-
-    return model_runner.model.compute_logits(outputs, last_only)
+    logits = model_runner.model.compute_logits(outputs, last_only)
+    # EAGLE draft: outputs is prenorm, return both
+    if "hidden_states" in graph_vars:
+        return logits, outputs
+    return logits
 
 
 cache = {}
 
 _plan_event = None  # Lazy-init CUDA event for plan() sync
 PROFILE = os.environ.get("SSD_PROFILE", "0") == "1"
+PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
+_draft_events = []  # [(step, label, start_event, end_event), ...]
+
+def flush_draft_profile():
+    """Sync once, read all CUDA events, print per-step breakdown, clear list."""
+    if not _draft_events:
+        return
+    torch.cuda.synchronize()
+    by_step = {}
+    for step, label, ev0, ev1 in _draft_events:
+        by_step.setdefault(step, []).append((label, ev0.elapsed_time(ev1)))
+    parts = []
+    total = 0.0
+    for step in sorted(by_step):
+        step_total = sum(t for _, t in by_step[step])
+        detail = " ".join(f"{l}={t:.2f}" for l, t in by_step[step])
+        parts.append(f"s{step}={step_total:.2f}({detail})")
+        total += step_total
+    print(f"[PROFILE draft_detail] K={len(by_step)} total={total:.2f}ms avg_step={total/len(by_step):.2f}ms | {' '.join(parts)}", flush=True)
+    _draft_events.clear()
 
 @torch.inference_mode()
-def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits):
+def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits, hidden_states=None):
     # bs != len(input_ids, positions) now in multi-query seting, also need step-dependent mask
     context = get_context()
     assert context.cu_seqlens_q is None, "ERROR in run_fi_tree_decode_cudagraph: cu_seqlens_q should be set to None so we don't take FA path"
@@ -324,6 +363,9 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         start_time.record()
 
     # Use precomputed CPU-packed masks (built at step 0)
+    if PROFILE_DRAFT:
+        _ev_mask0 = torch.cuda.Event(enable_timing=True); _ev_mask0.record()
+
     kv_indices = cache["precomputed_kv"][step]
     kv_indptr_cpu, kv_lpl_cpu = cache["plan_cpu_args"][step]
     qo_indptr_cpu = cache["cu_seqlens_q_cpu"]
@@ -349,6 +391,9 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     _plan_event.record()
     _plan_event.synchronize()
 
+    if PROFILE_DRAFT:
+        _ev_plan0 = torch.cuda.Event(enable_timing=True); _ev_plan0.record()
+
     plan_args = [
         wrapper._float_workspace_buffer, wrapper._int_workspace_buffer,
         wrapper._pin_memory_int_workspace_buffer,
@@ -364,6 +409,9 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         plan_args.extend([-1, False])
     wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
 
+    if PROFILE_DRAFT:
+        _ev_plan1 = torch.cuda.Event(enable_timing=True); _ev_plan1.record()
+
     if PROFILE:
         end_time.record()
         torch.cuda.synchronize()
@@ -375,6 +423,12 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     graph_vars["positions"][:flat_batch_size] = positions
     graph_vars["slot_mapping"][:flat_batch_size] = get_context().slot_mapping
     graph_vars["context_lens"][:B] = context_lens
+    if hidden_states is not None and "hidden_states" in graph_vars:
+        if hidden_states.shape[0] < flat_batch_size:
+            # Pad hidden_states to match padded batch
+            pad_n = flat_batch_size - hidden_states.shape[0]
+            hidden_states = torch.cat([hidden_states, torch.zeros(pad_n, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)])
+        graph_vars["hidden_states"][:flat_batch_size] = hidden_states
     if step == 0:
         graph_vars["block_tables"][:B, :block_tables.size(1)] = block_tables
 
@@ -384,7 +438,16 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         buffer_prep_time = start_time.elapsed_time(end_time)
         start_time.record()
 
+    if PROFILE_DRAFT:
+        _ev_replay0 = torch.cuda.Event(enable_timing=True); _ev_replay0.record()
+
     graph.replay()
+
+    if PROFILE_DRAFT:
+        _ev_replay1 = torch.cuda.Event(enable_timing=True); _ev_replay1.record()
+        _draft_events.append((step, "mask+buf", _ev_mask0, _ev_plan0))
+        _draft_events.append((step, "plan", _ev_plan0, _ev_plan1))
+        _draft_events.append((step, "replay", _ev_replay0, _ev_replay1))
 
     if PROFILE:
         end_time.record()
@@ -397,7 +460,12 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     if PROFILE:
         print(f"[run_fi_tree_decode_cudagraph] step {step}: precompute={precompute_time:.3f}ms, plan={plan_time:.3f}ms, buffer={buffer_prep_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
 
-    return logits_all[:orig_flat]
+    logits_out = logits_all[:orig_flat]
+    # EAGLE draft: also return prenorm (outputs) for self-conditioning
+    if "hidden_states" in graph_vars:
+        prenorm = graph_vars["outputs"][:orig_flat]
+        return logits_out, prenorm
+    return logits_out
 
 
 ## CAPTURE CUDAGRAPHS
@@ -451,10 +519,10 @@ def capture_cudagraph(model_runner):
     is_eagle_target = config.use_eagle and not model_runner.is_draft
     hidden_states = None
     if is_eagle_draft:
-        d_model_target = config.d_model_target or 4096
-        draft_hf = config.draft_hf_config if config.draft_hf_config is not None else hf_config
-        hidden_states = torch.zeros(max_bs, 3 * d_model_target,
-                                    dtype=draft_hf.torch_dtype, device=input_ids.device)
+        # Use hidden_size (d_model_draft) so CG captures the pass-through branch in Eagle3DraftForCausalLM.forward()
+        # All callers project target acts via fc() BEFORE passing to CG
+        hidden_states = torch.zeros(max_bs, hf_config.hidden_size,
+                                    dtype=hf_config.torch_dtype, device=input_ids.device)
 
     for bs in reversed(graph_bs_list):
         graph = torch.cuda.CUDAGraph()
@@ -598,6 +666,146 @@ def capture_verify_cudagraph(model_runner):
     return graph_vars, graph_pool, graphs, all_N
 
 
+@torch.inference_mode()
+def run_glue_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, hidden_states=None):
+    """Run EAGLE glue decode with FA causal + varlen cu_seqlens_q. No padding within sequences."""
+    context = get_context()
+    K = model_runner.config.speculate_k
+    two_kp1 = 2 * K + 1
+    orig_flat = input_ids.size(0)
+    orig_B = context.context_lens.size(0)
+    dev = input_ids.device
+
+    wrapper_bs = next(
+        x for x in model_runner.graph_bs_list["glue_decode"] if x >= orig_B)
+    graph = model_runner.graphs["glue_decode"][wrapper_bs]
+    max_flat = wrapper_bs * two_kp1
+
+    # Zero all non-output graph vars
+    for k, v in graph_vars.items():
+        if k != "outputs":
+            v.zero_()
+
+    # Copy real data into graph buffers (orig_flat <= max_flat always)
+    graph_vars["input_ids"][:orig_flat] = input_ids
+    graph_vars["positions"][:orig_flat] = positions
+    graph_vars["slot_mapping"][:orig_flat] = context.slot_mapping
+    # Pad remaining flat slots with -1 slot_mapping (no KV write)
+    if orig_flat < max_flat:
+        graph_vars["slot_mapping"][orig_flat:max_flat] = -1
+
+    graph_vars["context_lens"][:orig_B] = context.context_lens
+    graph_vars["block_tables"][:orig_B, :context.block_tables.size(1)] = context.block_tables
+
+    # cu_seqlens_q: real seqs, then ghost seqs (repeat last cumsum = 0-length queries)
+    cu = context.cu_seqlens_q  # [orig_B + 1]
+    graph_vars["cu_seqlens_q"][:orig_B + 1] = cu
+    if wrapper_bs > orig_B:
+        # Ghost seqs get 0-length queries
+        graph_vars["cu_seqlens_q"][orig_B + 1:wrapper_bs + 1] = cu[-1]
+        # Ghost seqs need valid block_tables/context_lens (copy last real seq)
+        pad_B = wrapper_bs - orig_B
+        graph_vars["context_lens"][orig_B:wrapper_bs] = context.context_lens[orig_B - 1]
+        graph_vars["block_tables"][orig_B:wrapper_bs] = context.block_tables[orig_B - 1]
+
+    if hidden_states is not None and "eagle_hidden_states" in graph_vars:
+        graph_vars["eagle_hidden_states"][:orig_flat] = hidden_states
+
+    graph.replay()
+
+    outputs = graph_vars["outputs"][:orig_flat]
+    logits = model_runner.model.compute_logits(outputs, last_only)
+    if "eagle_hidden_states" in graph_vars:
+        return logits, outputs
+    return logits
+
+
+@torch.inference_mode()
+def capture_glue_decode_cudagraph(model_runner):
+    """Capture CG for EAGLE glue decode: FA causal + varlen cu_seqlens_q, max flat = B*(2K+1)."""
+    config = model_runner.config
+    hf_config = config.hf_config
+    max_bs = min(config.max_num_seqs, 512)
+    K = config.speculate_k
+    two_kp1 = 2 * K + 1
+    max_flat = max_bs * two_kp1
+    max_num_blocks = (config.max_model_len + model_runner.block_size - 1) // model_runner.block_size
+
+    input_ids = torch.zeros(max_flat, dtype=torch.int64, device=model_runner.device)
+    positions = torch.zeros(max_flat, dtype=torch.int64, device=model_runner.device)
+    slot_mapping = torch.zeros(max_flat, dtype=torch.int32, device=model_runner.device)
+    context_lens = torch.full((max_bs,), config.max_model_len, dtype=torch.int32, device=model_runner.device)
+    block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=model_runner.device)
+    outputs = torch.empty(max_flat, hf_config.hidden_size, device=model_runner.device)
+    cu_seqlens_q = torch.zeros(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+
+    eagle_hs = None
+    if config.use_eagle and model_runner.is_draft:
+        eagle_hs = torch.zeros(max_flat, hf_config.hidden_size, dtype=hf_config.torch_dtype, device=model_runner.device)
+
+    graph_bs_list = [1]
+    for bs in [2, 4, 8] + list(range(16, max_bs + 1, 16)):
+        if bs <= max_bs:
+            graph_bs_list.append(bs)
+    if max_bs not in graph_bs_list:
+        graph_bs_list.append(max_bs)
+    graph_bs_list.sort()
+
+    graphs = {}
+    graph_pool = None
+
+    print(f'[capture_glue_decode_cudagraph] Capturing for bs={graph_bs_list}', flush=True)
+
+    for bs in reversed(graph_bs_list):
+        graph = torch.cuda.CUDAGraph()
+        flat = bs * two_kp1
+
+        # Uniform cu_seqlens_q for capture (each seq gets 2K+1 queries)
+        seqlen_q = torch.full((bs,), two_kp1, dtype=torch.int32, device=model_runner.device)
+        cu = cu_seqlens_q[:bs + 1]
+        cu.zero_()
+        cu[1:].copy_(torch.cumsum(seqlen_q, 0))
+
+        set_context(
+            is_prefill=False,
+            cu_seqlens_q=cu,
+            max_seqlen_q=two_kp1,
+            slot_mapping=slot_mapping[:flat],
+            context_lens=context_lens[:bs],
+            block_tables=block_tables[:bs],
+        )
+
+        if eagle_hs is not None:
+            outputs[:flat] = model_runner.model(input_ids[:flat], positions[:flat], eagle_hs[:flat])
+        else:
+            outputs[:flat] = model_runner.model(input_ids[:flat], positions[:flat])
+
+        with torch.cuda.graph(graph, graph_pool):
+            if eagle_hs is not None:
+                outputs[:flat] = model_runner.model(input_ids[:flat], positions[:flat], eagle_hs[:flat])
+            else:
+                outputs[:flat] = model_runner.model(input_ids[:flat], positions[:flat])
+
+        if graph_pool is None:
+            graph_pool = graph.pool()
+        graphs[bs] = graph
+        torch.cuda.synchronize()
+        reset_context()
+
+    graph_vars = dict(
+        input_ids=input_ids,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        cu_seqlens_q=cu_seqlens_q,
+        outputs=outputs,
+    )
+    if eagle_hs is not None:
+        graph_vars["eagle_hidden_states"] = eagle_hs
+
+    return graph_vars, graph_pool, graphs, graph_bs_list
+
 
 @torch.inference_mode()
 def capture_fi_tree_decode_cudagraph(model_runner):
@@ -630,6 +838,14 @@ def capture_fi_tree_decode_cudagraph(model_runner):
 
     graphs = {}
     graph_pool = None
+
+    # Eagle draft needs hidden_states for forward (d_model_draft, NOT 3*d_model_target)
+    # All callers project target acts via fc() BEFORE passing to CG
+    # MUST be outside the for-loop so all graphs share the same tensor
+    fi_hidden_states = None
+    if config.use_eagle and model_runner.is_draft:
+        fi_hidden_states = torch.zeros(max_flat_batch_size, hf_config.hidden_size,
+                                       dtype=hf_config.torch_dtype, device=model_runner.device)
 
     print(f'About to capture FI cudagraphs for bs={graph_bs_list}', flush=True)
 
@@ -678,14 +894,6 @@ def capture_fi_tree_decode_cudagraph(model_runner):
             context_lens=context_lens[:bs],
             block_tables=block_tables[:bs]
         )
-
-        # Eagle draft needs hidden_states for forward
-        fi_hidden_states = None
-        if config.use_eagle and model_runner.is_draft:
-            d_model_target = config.d_model_target or 4096
-            draft_hf = config.draft_hf_config if config.draft_hf_config is not None else hf_config
-            fi_hidden_states = torch.zeros(max_flat_batch_size, 3 * d_model_target,
-                                           dtype=draft_hf.torch_dtype, device=model_runner.device)
 
         # Warmup run
         if fi_hidden_states is not None:

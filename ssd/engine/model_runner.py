@@ -1,5 +1,6 @@
 
 import pickle
+import time
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -22,12 +23,14 @@ from ssd.engine.helpers.runner_helpers import (
     prepare_prefill_tensors_from_seqs
 )
 from ssd.engine.helpers.cudagraph_helpers import (
-    run_verify_cudagraph, 
-    run_decode_cudagraph, 
+    run_verify_cudagraph,
+    run_decode_cudagraph,
     run_fi_tree_decode_cudagraph,
-    capture_cudagraph, 
-    capture_verify_cudagraph, 
-    capture_fi_tree_decode_cudagraph, 
+    run_glue_decode_cudagraph,
+    capture_cudagraph,
+    capture_verify_cudagraph,
+    capture_fi_tree_decode_cudagraph,
+    capture_glue_decode_cudagraph,
     get_custom_mask,
 )
     
@@ -145,7 +148,7 @@ class ModelRunner:
                     # can proceed, nothing to clean up 
                     pass
                 
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20) 
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**28)
                 dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # leader on tp_group 
             else: 
                 dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # follower on tp_group, don't want them hooking onto shm before its been created 
@@ -202,6 +205,7 @@ class ModelRunner:
                     mask_indptr_buf=mask_indptr_buf[:bs + 1],
                 )
             print(f'wrapper backend is {self.prefill_wrappers[bs]._backend}', flush=True)
+
 
     def setup_and_warmup_model_and_cudagraphs(self, config: Config, hf_config: AutoConfig, init_q=None, is_draft=False):
         # cudagraphs 
@@ -280,8 +284,8 @@ class ModelRunner:
             self.graph_pools["decode"] = decode_graph_pool
             self.graphs["decode"] = decode_graphs
             self.graph_bs_list["decode"] = decode_graph_bs_list
-            if self.config.speculate: # let draft capture it too; we'll use it in glue decode for seq fan out
-                verify_graph_vars, verify_graph_pool, verify_graphs, verify_graph_bs_list = capture_verify_cudagraph(self)  # verify cudagraph, target only
+            if self.config.speculate and not (self.is_draft and self.config.use_eagle):  # verify CG: target always, non-EAGLE draft for fan-out; EAGLE draft uses glue_decode CG instead
+                verify_graph_vars, verify_graph_pool, verify_graphs, verify_graph_bs_list = capture_verify_cudagraph(self)
                 self.graph_vars["verify"] = verify_graph_vars
                 self.graph_pools["verify"] = verify_graph_pool
                 self.graphs["verify"] = verify_graphs
@@ -292,6 +296,12 @@ class ModelRunner:
                 self.graph_pools["fi_tree_decode"] = fi_tree_decode_graph_pool
                 self.graphs["fi_tree_decode"] = fi_tree_decode_graphs
                 self.graph_bs_list["fi_tree_decode"] = fi_tree_decode_graph_bs_list
+            if self.config.speculate and self.is_draft and self.config.draft_async and self.config.use_eagle:
+                glue_gv, glue_pool, glue_graphs, glue_bs_list = capture_glue_decode_cudagraph(self)
+                self.graph_vars["glue_decode"] = glue_gv
+                self.graph_pools["glue_decode"] = glue_pool
+                self.graphs["glue_decode"] = glue_graphs
+                self.graph_bs_list["glue_decode"] = glue_bs_list
 
         return model_type
 
@@ -417,6 +427,7 @@ class ModelRunner:
         assert self.world_size > 1 and not self.rank
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        assert n + 4 <= self.shm.size, f"SHM overflow: {n+4} > {self.shm.size}. Increase SHM buffer size."
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -500,7 +511,7 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 if self.is_draft and self.draft_async and not self.enforce_eager:
-                    module.prefill_wrappers = self.prefill_wrappers # give all layers access to the wrapper they'll need to .run()
+                    module.prefill_wrappers = self.prefill_wrappers
                 elif self.is_draft and self.draft_async and self.enforce_eager:
                     module.only_prefill_wrapper = self.only_prefill_wrapper # this will make it not None so it can be used on fwd
                 layer_id += 1
@@ -622,12 +633,15 @@ class ModelRunner:
                 logits = self.model.compute_logits(outputs, last_only)
                 return logits 
 
-        elif is_tree_decode: 
-            return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits)
-        elif is_mq_kp1: # verify or glue decode, draft or target, "verify" ~ mq decode of len K+1
+        elif is_tree_decode:
+            return run_fi_tree_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["fi_tree_decode"], tree_decode_step, cache_hits, hidden_states=hidden_states)
+        elif is_mq_kp1 and hidden_states is not None and "glue_decode" in self.graph_vars:
+            # EAGLE draft glue decode with 2K+1 per seq
+            return run_glue_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["glue_decode"], hidden_states)
+        elif is_mq_kp1: # verify or non-EAGLE glue decode, "verify" ~ mq decode of len K+1
             return run_verify_cudagraph(self, input_ids, positions, last_only, self.graph_vars["verify"])
-        else: # draft decoding in sync spec 
-            return run_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["decode"])
+        else: # draft decoding in sync spec or JIT single-token decode
+            return run_decode_cudagraph(self, input_ids, positions, last_only, self.graph_vars["decode"], hidden_states=hidden_states)
 
 
     # should add spec_k that just loops this k times
@@ -639,12 +653,21 @@ class ModelRunner:
         draft_return_logits: bool = False,
         hidden_states: torch.Tensor | None = None
     ) -> list[int] | tuple[list[int], torch.Tensor]:
+        _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1" and not is_prefill and not last_only
+        if _pt:
+            torch.cuda.synchronize()
+            _r0 = time.perf_counter()
+
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
         else:
-            input_ids, positions = self.prepare_decode(seqs, verify=not last_only) 
+            input_ids, positions = self.prepare_decode(seqs, verify=not last_only)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        
+
+        if _pt:
+            torch.cuda.synchronize()
+            _r1 = time.perf_counter()
+
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
         conditioning = None
         if self.config.use_eagle:
@@ -652,7 +675,12 @@ class ModelRunner:
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         else:
             logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
-        
+
+        if _pt:
+            torch.cuda.synchronize()
+            _r2 = time.perf_counter()
+            print(f"[PROFILE target_run] prepare_decode={(_r1-_r0)*1000:.2f}ms run_model={(_r2-_r1)*1000:.2f}ms eagle={self.config.use_eagle} n_ids={input_ids.shape[0]}", flush=True)
+
         if last_only:
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             reset_context()
