@@ -22,12 +22,18 @@ DEFAULT_DRAFT = os.environ.get(
     f"{HF_CACHE_DIR}/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6",
 )
 
-# eagle3 specforge draft for 70b target. this is the draft head trained by
-# lmsys specifically for llama-3.3-70b; if you're running eagle3 with a
-# different target you'll need to point this at the right checkpoint.
+# eagle3 draft model paths. override via env vars if your models live elsewhere.
 EAGLE3_SPECFORGE_70B = os.environ.get(
-    "SSD_EAGLE3_SPECFORGE",
-    f"{HF_CACHE_DIR}/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
+    "SSD_EAGLE3_SPECFORGE_70B",
+    "/data/tkumar/huggingface/hub/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
+)
+EAGLE3_YUHUILI_8B = os.environ.get(
+    "SSD_EAGLE3_8B",
+    f"{HF_CACHE_DIR}/models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B",
+)
+EAGLE3_QWEN_32B = os.environ.get(
+    "SSD_EAGLE3_QWEN_32B",
+    f"{HF_CACHE_DIR}/models--RedHatAI--Qwen3-32B-speculator.eagle3",
 )
 
 # directory containing preprocessed benchmark datasets (jsonl files).
