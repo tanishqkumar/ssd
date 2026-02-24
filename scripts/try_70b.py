@@ -52,6 +52,7 @@ def main():
 
     if len(prompts) > 0:
         first_prompt = prompts[0]
+        print(f"First prompt tokens: {first_prompt}")
         print(f"First prompt text: {tokenizer.decode(first_prompt)}")
 
         input_ids = torch.tensor([first_prompt], dtype=torch.long, device=device)
@@ -62,6 +63,7 @@ def main():
             logits = outputs.logits
 
         print(f"Output logits shape: {logits.shape}")
+        print(f"Sample logits (first 10 of last position): {logits[0, -1, :10]}")
 
 
 if __name__ == "__main__":
