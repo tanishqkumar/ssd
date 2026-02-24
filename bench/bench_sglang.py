@@ -1,16 +1,15 @@
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import ssd.paths  # noqa: F401 — sets TORCH_CUDA_ARCH_LIST before flashinfer import
 import time
 import argparse
 from random import seed
 from typing import Tuple
-import sys
 import json
 from transformers import AutoTokenizer
 import wandb
 from bench_helpers import get_model_paths, generate_benchmark_inputs, DATASET_PATHS
-
-# Set CUDA architecture for H100
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
 
 def main():
