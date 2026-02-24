@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""
-Script to download Llama 3.1 and 3.2 models from Hugging Face Hub.
-"""
-
-import os
 from huggingface_hub import snapshot_download
 
 
 def download_llama_models():
-    """Download Llama 3.1 and 3.2 models to hub directory structure."""
-
-    # Define models to download
     models = [
         # "meta-llama/Llama-3.1-8B-Instruct",
         "meta-llama/Llama-3.3-70B-Instruct",
@@ -19,7 +11,6 @@ def download_llama_models():
         # "meta-llama/Llama-3.2-3B-Instruct"
     ]
 
-    # Set cache directory to the specified target location
     cache_dir = "/data/tkumar/huggingface/hub"
 
     for model_name in models:

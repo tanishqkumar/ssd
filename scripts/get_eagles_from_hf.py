@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""
-Script to download EAGLE3 draft models from Hugging Face Hub.
-"""
-
-import os
 from huggingface_hub import snapshot_download
 
 
 def download_eagle_models():
-    """Download EAGLE3 draft models to hub directory structure."""
-
-    # Define models to download
     models = [
         "yuhuili/EAGLE3-LLaMA3.3-Instruct-70B",
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         "RedHatAI/Qwen3-32B-speculator.eagle3"
     ]
 
-    # Set cache directory to the specified target location
     cache_dir = "/data/tkumar/huggingface/hub"
 
     for model_name in models:
