@@ -56,7 +56,6 @@ def verify(
     # AND be cache hits (i.e., tokens were actually sampled from q).
     base_ratio_rows = ((temps_t > 0) | (temps_q > 0))
     
-    # TODO: understanding why we gate on cache_hits is important, maybe cause of our --x not working
     if jit_speculate:
         ratio_rows = base_ratio_rows
     else:

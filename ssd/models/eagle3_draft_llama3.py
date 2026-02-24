@@ -1,8 +1,7 @@
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import LlamaConfig  # Changed from Qwen3Config
-
+from transformers import LlamaConfig
 from ssd.layers.activation import SiluAndMul
 from ssd.layers.attention import Attention
 from ssd.layers.layernorm import RMSDNorm
@@ -158,8 +157,7 @@ class Eagle3DraftModel(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,  # Changed from Qwen3Config
-        draft: bool = False,
+        config: LlamaConfig,        draft: bool = False,
         speculate: bool = False,
         spec_k: int = 1,
         async_fan_out: int = 1,
@@ -351,65 +349,4 @@ class Eagle3DraftForCausalLM(nn.Module):
         logits_full = logits.new_full((B, vocab_size), float('-inf'))
         logits_full[:, target_indices] = logits
         
-        return logits_full 
-
-''' 
------ eagle3 draft weights for target=llama 3.1 8b ----- 
-Weights in pytorch_model.bin:
-  d2t: torch.Size([32000])
-  t2d: torch.Size([128256])
-  midlayer.self_attn.q_proj.weight: torch.Size([4096, 8192])      model.layer.self_attn.qkv_proj.weight
-  midlayer.self_attn.k_proj.weight: torch.Size([1024, 8192])
-  midlayer.self_attn.v_proj.weight: torch.Size([1024, 8192])
-  midlayer.self_attn.o_proj.weight: torch.Size([4096, 4096])
-  midlayer.mlp.gate_proj.weight: torch.Size([14336, 4096])
-  midlayer.mlp.up_proj.weight: torch.Size([14336, 4096])
-  midlayer.mlp.down_proj.weight: torch.Size([4096, 14336])
-  midlayer.hidden_norm.weight: torch.Size([4096])
-  midlayer.input_layernorm.weight: torch.Size([4096])
-  midlayer.post_attention_layernorm.weight: torch.Size([4096])
-  norm.weight: torch.Size([4096])
-  fc.weight: torch.Size([4096, 12288])
-  lm_head.weight: torch.Size([32000, 4096])
------ 
-
-EAGLE3 control flow - one round of speculation 
-
-- Target concats 3 layer preactivations at last accepted token (last token on prefill, bonus token on decode) into a [num_tokens, 3 * d_model_target] tensor    
-    - This is done at layers [2, num_layers//2, num_layers-3] by default 
-- Sends to draft over NCCL as part of the handshake protocol (all sequence positions in prefill, list of single tokens in decode)
-If PREFILL
-    - Draft receives [num_tokens, 3 * d_model_target]
-    - Draft projects using FC to get [num_tokens, d_model_draft]
-    - Draft fwd takes in [num_tokens, 2 * d_model_draft] as we cat[last_prefill_token_activation_projected; next_token_id_from_prefill_embedded]
-    - The attn layer is is 2D -> D so that MLP still sees dimension D 
-    - Draft KV cache updated (target fires and forgets in our codebase) with inputs that includes target activations 
-If DECODE 
-    - Draft projects to d_model_draft via fc for first token on every speculation round (ie. iter 0 of tree decode)
-        - Uses its own lm_head preactivations which are d_model_draft as conditioning input in later iter > 0 of tree decode 
-    - Do similar to prefill where we draft fwd but decode so num_tokens = B (num seqs being decoded)
-    - Keep prenorms before lm_head as well as logits after lm_head, use the former as input to the next iter and the latter for sampling the token also for the next iter 
-    - Draft always operates on target vocab token IDs. Draft LM head outputs draft_vocab_size logits, expanded to vocab_size in compute_logits via d2t mapping 
-
-
-Impl plan: 
-    - modify LlamaModel to take in hidden states, cat two things, output logits and prelogits for next round
-        - make sure attn layer is 2D -> D (eg. by wiring in cfg), hook up to an attnLayer and a kv cache 
-        - test decoding with correct shapes, double check arch and norms, ie. if we get activations we can decode just fine 
-    - add draft weight loader support 
-    - wire through config and init support in ModelRunner/LLMEngine (support only greedy decoding for now)
-        - if cfg.use_eagle, then the target should collect activations 
-    - support prefill, collecting and sending all activations via fire and forget 
-    - add support for sending just single activations in handshake 
-
-
-Details to check 
-    - add vs cat of conditioning vector vs just wiring it into residual stream directly 
-    - draft kv cache handling 
-    - correct target activation layers and concatentation 
-    - make sure eagle draft arch is exactly correct (see vLLM issue, pay attention to layernorm positioning, 
-        see https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/modeling_llama_kv.py etc to check our arch/weights loaded are consistent)
-    - tracking draft activations for self-conditioning in tree decode 
-    - glue decode, may need to store previous iter draft activations for self-conditioning 
-    - torch compile / cudagraph support for draft fwd / capturing 
-'''
+        return logits_full

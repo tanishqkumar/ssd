@@ -155,16 +155,8 @@ def logits_alignment_sanity_test(relevant_logits_reshaped, B, K, F):
         print(f'[get_forked_recovery_tokens_from_logits] logits alignment check FAILED :(', flush=True)
 
 
-# self.kv_cache = torch.zeros(
-#     2,
-#     hf_config.num_hidden_layers,
-#     config.num_kvcache_blocks,
-#     self.block_size,
-#     num_kv_heads,
-#     hf_config.head_dim,
-# )
 
-# want all slots up to context_len using seq.draft_block_table 
+
 def get_conditioning_tensor_test(kv_cache, block_table, context_len): # use branch_bt and pass in context_len manually to see if our winning fork used the same conditioning tensor when tree decoding as the verifier when verifying
     block_size = kv_cache.shape[3]
     num_full_blocks = context_len // block_size

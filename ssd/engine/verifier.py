@@ -30,7 +30,6 @@ class Verifier(VerifierBase):
         self.metrics = metrics
 
     def prefill(self, seqs: list[Sequence], eagle: bool = False) -> VerifyResult:
-        # TODO: Eagle
         result = self.target_model_runner.call("run", seqs, True)
         if eagle:
             token_ids, eagle_acts = result

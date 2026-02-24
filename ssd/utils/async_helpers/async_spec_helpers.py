@@ -2,8 +2,6 @@ import torch
 from ssd.config import Config
 from transformers import AutoTokenizer
 
-VERBOSE = False
-
 @torch.inference_mode()
 def compute_megaspec_lookahead(MQ_LEN: int, K: int) -> int:
     return K + 1 + K * MQ_LEN 
@@ -25,10 +23,7 @@ def make_glue_decode_input_ids(
     
     return out 
 
-# will need to make this cache_hits aware, we use [0:F_i for misses and 1:F_i+1 for hits] on interior and always 0:F_i for last token
-# TODO: understand this new logic for misses and also add interior logic + add vectorized cache hits 
-def get_forked_recovery_tokens_from_logits(config: Config, logits: torch.Tensor, cache_hits: torch.Tensor, returned_tokens: torch.Tensor, tokenizer: AutoTokenizer): 
-    # add "except the speculated token" constraint and assert it's equal to below 
+def get_forked_recovery_tokens_from_logits(config: Config, logits: torch.Tensor, cache_hits: torch.Tensor, returned_tokens: torch.Tensor, tokenizer: AutoTokenizer):
     """
     logits: Float[Tensor] of shape [B, K+1, V]
     fan_out_list: list[int] of length K+1 with per-position topk, or int to use for all positions
