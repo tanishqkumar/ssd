@@ -1,18 +1,11 @@
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import json
 from random import randint
 from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
-
-
-# Dataset file paths on local system
-DATASET_PATHS = {
-    "humaneval": "/data/tkumar/huggingface/processed_datasets/humaneval/humaneval_data_10000.jsonl",
-    "alpaca": "/data/tkumar/huggingface/processed_datasets/alpaca/alpaca_data_10000.jsonl",
-    "c4": "/data/tkumar/huggingface/processed_datasets/c4/c4_data_10000.jsonl",
-    "gsm": "/data/tkumar/huggingface/processed_datasets/gsm8k/gsm8k_data_10000.jsonl",
-    "ultrafeedback": "/data/tkumar/huggingface/processed_datasets/ultrafeedback/ultrafeedback_data_10000.jsonl",
-}
+from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B
 
 
 def _get_snapshot_path(base_path: str) -> str:
@@ -58,10 +51,8 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
             if args.size == "8":
                 return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B")
             elif args.size == "70":
-                # Use SpecForge draft (correct rope_theta=500k, same hidden_size as target)
-                specforge_path = "/data/tkumar/huggingface/hub/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge"
-                if os.path.isdir(specforge_path):
-                    return specforge_path
+                if os.path.isdir(EAGLE3_SPECFORGE_70B):
+                    return EAGLE3_SPECFORGE_70B
                 return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.3-Instruct-70B")
             else:
                 raise ValueError(f"EAGLE draft not available for Llama size {args.size}")
@@ -101,7 +92,7 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
             return os.path.join(cache_dir, f"models--Qwen--{draft_model_name}")
 
 
-def get_model_paths(args, cache_dir: str = "/data/shared/huggingface/hub/") -> Tuple[str, str, Optional[str]]:
+def get_model_paths(args, cache_dir: str = HF_CACHE_DIR) -> Tuple[str, str, Optional[str]]:
     """Resolve model and draft paths (pointing to snapshot dirs with config.json)."""
     if args.llama:
         size_to_model = {
