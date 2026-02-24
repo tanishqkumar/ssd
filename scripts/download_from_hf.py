@@ -4,6 +4,10 @@ from huggingface_hub import snapshot_download
 
 MODELS = {
     "llama": [
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.1-70B-Instruct",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "meta-llama/Llama-3.2-3B-Instruct",
         "meta-llama/Llama-3.3-70B-Instruct",
     ],
     "qwen": [
