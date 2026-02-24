@@ -48,16 +48,6 @@ class DraftRunner(ModelRunner):
             print(f'DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
 
-    
-    # todo:
-    # - normally we do a prefill on draft with target activations after we get a verification outcome 
-    # - since we wait for the verification outcome to speculate on top of in ordinary (sync) spec
-    # - but here (async) when we glue decode the spec we just sent back we obv don't have its target activations yet (since target by defn hasn't verified) so we have to use our own 
-    # - where "our own" is stored in the tree cache for each spec rollout, where the glue decode is the tokens we just sent back so they must be in the tree cache
-    # - thus, all token fwds are self conditioned in [glue, tree] besides the first token (which is target conditioned input rec token after a verify, with acts from target)
-    # - this first token act from target should be sent over nccl along with each cache request, and should correpond to target preact (3 * d_model_target) that led to the logits from which rec token was sampled 
-    # - in the first iter, when the token sampled from target sequence to prefill is set as the first rec token, and we make a dummy cache request that always ends in a miss, 
-        # eg. with req key ("I", -2, 0) in "how can I" to the draft after target/draft prefill, how should we handle given we sent g_can (which would go with e_I in fwd) target -> draft in fwd? should we send dummy act and not use? 
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
 
@@ -831,10 +821,6 @@ class DraftRunner(ModelRunner):
         seq_ids_expanded = payload["seq_ids_expanded"].to(torch.int64)
         rec_flat = payload["rec_flat"].to(torch.int64)
 
-        # B = payload["block_tables"].shape[0]
-        # k_flat = torch.arange(self.config.speculate_k + 1, device=self.device, dtype=torch.int64)[None, :, None].expand(
-        #     B, self.config.speculate_k + 1, self.config.async_fan_out).flatten()
-
         k_flat = torch.cat([self._fan_idx_hit if hit else self._fan_idx_miss for hit in payload["cache_hits_list"]])
 
         assert k_flat.shape[0] == payload["block_tables"].shape[0] * self.config.MQ_LEN, f"ERROR in _populate_tree_cache: k_flat should be {payload['block_tables'].shape[0] * self.config.MQ_LEN}, got {k_flat.shape[0]}"
@@ -874,7 +860,7 @@ class DraftRunner(ModelRunner):
                         print(f"    k={k_idx}, rec={rec_token.item()} ('{rec_text}') -> {spec_text}", flush=True)
             print(f"{'='*80}\n", flush=True)
     
-    def _start_interrupt_listener(self):  # TODO: do we need an irecv here? do we use it? or should we just listen after we finish tree decoding
+    def _start_interrupt_listener(self):
         """Initiates a non-blocking receive for the next command to allow interruption."""
         cmd_tensor = torch.empty(1, dtype=torch.int64, device=self.device)
         work_handle = dist.irecv(cmd_tensor, src=0, group=self.async_pg)

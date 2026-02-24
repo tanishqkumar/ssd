@@ -1,5 +1,5 @@
 import os
-os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0'  # for FlashInfer
+import ssd.paths  # noqa: F401 — sets TORCH_CUDA_ARCH_LIST before flashinfer import
 import sys
 import time
 import argparse
