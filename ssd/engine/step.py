@@ -96,9 +96,9 @@ class SpecDecodeStep(InferenceStep):
 
         # Save lightweight state instead of expensive clone_spec deep copy.
         # speculate() modifies: token_ids (append+extend), num_tokens, last_token, num_draft_cached_tokens
-        # verify() only reads seq state, does not modify it.
+        # verify() modifies: num_cached_tokens (line 77 of verifier.py)
         # postprocess_speculate() needs the ORIGINAL state to apply new suffixes.
-        saved = [(len(seq.token_ids), seq.num_tokens, seq.last_token, seq.num_draft_cached_tokens) for seq in seqs]
+        saved = [(len(seq.token_ids), seq.num_tokens, seq.last_token, seq.num_draft_cached_tokens, seq.num_cached_tokens) for seq in seqs]
 
         eagle_sentinel = True if self.eagle else None
         in_verify_result = VerifyResult(
@@ -136,12 +136,13 @@ class SpecDecodeStep(InferenceStep):
                 decoded_tokens = decode_tokens(new_suffix + [recovery_tokens[i]], self.tokenizer)
                 print(f"[SpecDecodeStep] verification {i}: {decoded_tokens}", flush=True)
 
-        # Restore original seq state before postprocess (undo speculate's modifications)
-        for seq, (orig_len, orig_nt, orig_lt, orig_ndc) in zip(seqs, saved):
+        # Restore original seq state before postprocess (undo speculate + verify modifications)
+        for seq, (orig_len, orig_nt, orig_lt, orig_ndc, orig_nct) in zip(seqs, saved):
             del seq.token_ids[orig_len:]
             seq.num_tokens = orig_nt
             seq.last_token = orig_lt
             seq.num_draft_cached_tokens = orig_ndc
+            seq.num_cached_tokens = orig_nct
 
         #### STEP 3: POSTPROCESS ####
         self.scheduler.postprocess_speculate(
