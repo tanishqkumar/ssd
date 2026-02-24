@@ -61,6 +61,8 @@ class DraftRunner(ModelRunner):
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
 
+        print(f'[draft_async_prefill] DRAFT ASYNC PREFILL STARTING', flush=True)
+
         # 1) Receive metadata then individual tensors
         # First recv metadata to learn sizes
         metadata = torch.zeros(5, dtype=torch.int64, device=self.device)
@@ -70,6 +72,7 @@ class DraftRunner(ModelRunner):
             assert eagle_act_dim == 3 * self.config.d_model_target, (
                 f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
             )
+        print(f'[draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, batch_size={batch_size}, max_blocks={max_blocks}, use_eagle={use_eagle}, eagle_act_dim={eagle_act_dim}', flush=True)
 
         # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
         fused_total = total_new_tokens + batch_size + batch_size * max_blocks
@@ -107,6 +110,7 @@ class DraftRunner(ModelRunner):
         else:
             self.run_model(input_ids, positions, is_prefill=True, last_only=True, hidden_states=eagle_acts)
 
+        print(f'[draft_async_prefill] DRAFT ASYNC PREFILL DONE', flush=True)
         # 7) clean up
         reset_context()
 

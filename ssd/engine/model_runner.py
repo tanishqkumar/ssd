@@ -60,7 +60,7 @@ class ModelRunner:
         
         # TODO: Get rid of this.
         if self.is_draft:
-            should_use_dist = self.config.draft_async
+            should_use_dist = self.config.draft_async and self.config.async_nccl_port is None
         else:
             should_use_dist = self.config.num_gpus > 1
 
@@ -257,7 +257,17 @@ class ModelRunner:
         load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
-            self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
+            if config.async_nccl_port is not None:
+                from torch.distributed import TCPStore
+                from ssd.utils.dist_utils import init_custom_process_group
+                store = TCPStore("127.0.0.1", port=config.async_nccl_port,
+                                 world_size=2, is_master=False)
+                with torch.cuda.device(self.device):
+                    self.async_pg = init_custom_process_group(
+                        backend="nccl", store=store, world_size=2, rank=1,
+                        group_name="async_spec")
+            else:
+                self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
         if self.verbose:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
         if config.sampler_x is not None:
@@ -358,7 +368,7 @@ class ModelRunner:
                 pass
             try:
                 # Default group
-                if self.world_size > 1 or (self.draft_async and self.is_draft):
+                if (self.world_size > 1 or (self.draft_async and self.is_draft)) and self.config.async_nccl_port is None:
                     dist.destroy_process_group()
             except Exception:
                 pass

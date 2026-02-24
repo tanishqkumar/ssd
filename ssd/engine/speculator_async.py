@@ -3,7 +3,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from ssd.engine.helpers.speculate_types import SpeculateResult, VerifyResult, SpeculatorBase
-from ssd.engine.helpers.runner_helpers import prepare_prefill_payload
+from ssd.engine.helpers.runner_helpers import prepare_prefill_payload, send_prefill_request
 from ssd.engine.sequence import Sequence
 from ssd.utils.misc import decode_tokens
 from ssd.utils.async_helpers.nccl_pack import send_int64
@@ -81,12 +81,16 @@ class SpeculatorAsync(SpeculatorBase):
             input_id_list, eagle_acts, self.device, max_blocks,
             [seq.draft_block_table for seq in seqs],
         )
-        dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
-        dist.send(metadata, dst=self.draft_runner_rank, group=self.async_pg)
-        send_int64(self.async_pg, self.draft_runner_rank,
-                   input_ids, num_tokens, draft_block_table.to(torch.int64))
-        if eagle_acts is not None:
-            dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
+        send_prefill_request(
+            cmd,
+            metadata,
+            input_ids,
+            num_tokens,
+            draft_block_table,
+            eagle_acts,
+            self.async_pg,
+            self.draft_runner_rank,
+        )
         return SpeculateResult([], [])
 
     def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:

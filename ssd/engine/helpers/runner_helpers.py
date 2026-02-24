@@ -1,3 +1,4 @@
+from typing import Any
 import torch
 import torch.distributed as dist
 
@@ -96,6 +97,47 @@ def receive_speculation_response(
     return speculations, logits_q, cache_hits
 
 
+def prepare_prefill_metadata(
+    total_new_tokens: int,
+    batch_size: int,
+    max_blocks: int,
+    eagle: bool,
+    eagle_act_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    metadata = torch.tensor([
+        total_new_tokens,
+        batch_size,
+        max_blocks,
+        1 if eagle else 0,
+        eagle_act_dim if eagle else 0,
+    ], dtype=torch.int64, device=device)
+    return metadata
+
+
+def send_prefill_request(
+    cmd: torch.Tensor,
+    metadata: torch.Tensor,
+    input_ids: torch.Tensor,
+    num_tokens: torch.Tensor,
+    draft_block_table: torch.Tensor,
+    eagle_acts: torch.Tensor,
+    draft_process_group: dist.ProcessGroup,
+    draft_runner_rank: int,
+):
+    dist.send(cmd, dst=draft_runner_rank, group=draft_process_group)
+    dist.send(metadata, dst=draft_runner_rank, group=draft_process_group)
+    send_int64(
+        draft_process_group,
+        draft_runner_rank,
+        input_ids,
+        num_tokens,
+        draft_block_table.to(torch.int64),
+    )
+    if eagle_acts is not None:
+        dist.send(eagle_acts, dst=draft_runner_rank, group=draft_process_group)
+
+
 def prepare_prefill_payload(
     input_id_list: list[list[int]],
     eagle_acts: torch.Tensor,
@@ -125,13 +167,14 @@ def prepare_prefill_payload(
     cmd = torch.tensor([1], dtype=torch.int64, device=device)
 
     # 4) send metadata for tensor reconstruction
-    metadata = torch.tensor([
+    metadata = prepare_prefill_metadata(
         input_ids_flat.size(0),
-        len(input_id_list),  # batch_size
+        num_tokens.shape[0],
         max_blocks,
-        1 if eagle_acts is not None else 0,
+        eagle_acts is not None,
         eagle_acts.shape[1] if eagle_acts is not None else 0,
-    ], dtype=torch.int64, device=device)
+        device,
+    )
 
     if eagle_acts is not None:
         assert eagle_acts.shape[0] == input_ids_flat.shape[0], (

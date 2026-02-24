@@ -30,7 +30,8 @@ class Config:
     fan_out_list: list[int] | None = None
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
-    jit_speculate: bool = False 
+    jit_speculate: bool = False
+    async_nccl_port: int | None = None
 
     # eagle3
     use_eagle: bool = False 
@@ -102,4 +103,5 @@ class Config:
         # assert self.max_num_batched_tokens >= self.max_model_len
         if self.max_num_batched_tokens < self.max_model_len:
             print(f'[Config] Warning: max_num_batched_tokens ({self.max_num_batched_tokens}) is less than max_model_len ({self.max_model_len})', flush=True)
+            print(f'[Config] Setting max_num_batched_tokens to max_model_len', flush=True)
             self.max_num_batched_tokens = self.max_model_len
