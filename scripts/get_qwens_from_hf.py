@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""
-Script to download Qwen3 models from Hugging Face Hub.
-"""
-
-import os
 from huggingface_hub import snapshot_download
 
+
 def download_qwen_models():
-    """Download Qwen3 models to hub directory structure."""
-    
-    # Define models to download
     models = [
         "Qwen/Qwen3-0.6B", 
         "Qwen/Qwen3-1.7B",
@@ -19,7 +12,6 @@ def download_qwen_models():
         "Qwen/Qwen3-32B"
     ]
     
-    # Set cache directory to the specified target location
     cache_dir = "/data/tkumar/huggingface/hub"
 
     for model_name in models:
