@@ -192,14 +192,7 @@ class RowParallelLinear(LinearBase):
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
-    # def forward(self, x: torch.Tensor) -> torch.Tensor:
-    #     y = F.linear(x, self.weight, None)
-    #     if self.tp_size > 1:
-    #         dist.all_reduce(y, group=self.tp_group)
-    #     if self.bias is not None and self.tp_rank == 0:
-    #         y = y + self.bias
-    #     return y
-    def forward(self, x: torch.Tensor) -> torch.Tensor: # need to fix this for TP>1 TODO as well as context check on draft prefill before profiling critical path 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y, group=self.tp_group) # like before 

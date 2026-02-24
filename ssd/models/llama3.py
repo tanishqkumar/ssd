@@ -1,8 +1,7 @@
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import LlamaConfig  # Changed from Qwen3Config
-
+from transformers import LlamaConfig
 from ssd.layers.activation import SiluAndMul
 from ssd.layers.attention import Attention
 from ssd.layers.layernorm import RMSDNorm
@@ -285,8 +284,7 @@ class LlamaForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: LlamaConfig,  # Changed from Qwen3Config
-        draft: bool = False,
+        config: LlamaConfig,        draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
         eagle_layers: list[int] | None = None,

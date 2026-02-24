@@ -3,7 +3,6 @@ from torch import nn
 import triton
 import triton.language as tl
 
-# from flash_attn import flash_attn_varlen_func
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from ssd.utils.context import get_context
 

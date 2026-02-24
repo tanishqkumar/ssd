@@ -20,7 +20,6 @@ def get_mask_iter_i(i: int, prefix_len: int, K: int, F: int) -> torch.Tensor:
     assert mask.size(1) == prefix_len + (K+1) + (i+1) * q_len, f"ERROR in get_mask_iter_i: mask should have length q_len + (K+1) + (i+1) * q_len, got {mask.size(1)}"
     return mask.to(torch.bool)
 
-# TODO: now glue_and_rec becomes [b] depedent based on cache_hits
 @torch.inference_mode()
 def _precompute_mask_components(K: int, F: int, max_step: int, max_context_len: int, device: torch.device, fan_out_list: torch.Tensor, fan_out_list_miss: torch.Tensor):
     """Precompute the static components of masks including a large ones tensor for prefix masks."""
