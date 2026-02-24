@@ -1,5 +1,6 @@
 
 import pickle
+import time
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -652,12 +653,21 @@ class ModelRunner:
         draft_return_logits: bool = False,
         hidden_states: torch.Tensor | None = None
     ) -> list[int] | tuple[list[int], torch.Tensor]:
+        _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1" and not is_prefill and not last_only
+        if _pt:
+            torch.cuda.synchronize()
+            _r0 = time.perf_counter()
+
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
         else:
-            input_ids, positions = self.prepare_decode(seqs, verify=not last_only) 
+            input_ids, positions = self.prepare_decode(seqs, verify=not last_only)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        
+
+        if _pt:
+            torch.cuda.synchronize()
+            _r1 = time.perf_counter()
+
         # Handle EAGLE returning (logits, conditioning_vector for next iter)
         conditioning = None
         if self.config.use_eagle:
@@ -665,7 +675,12 @@ class ModelRunner:
                 input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
         else:
             logits = self.run_model(input_ids, positions, is_prefill, last_only, hidden_states=hidden_states)
-        
+
+        if _pt:
+            torch.cuda.synchronize()
+            _r2 = time.perf_counter()
+            print(f"[PROFILE target_run] prepare_decode={(_r1-_r0)*1000:.2f}ms run_model={(_r2-_r1)*1000:.2f}ms eagle={self.config.use_eagle} n_ids={input_ids.shape[0]}", flush=True)
+
         if last_only:
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             reset_context()

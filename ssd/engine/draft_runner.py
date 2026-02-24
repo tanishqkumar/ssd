@@ -9,6 +9,9 @@ from ssd.config import Config
 from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.utils.async_helpers.nccl_pack import recv_int64
+from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
+
+PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 
 ttl = 0
 ttl_hit = 0
@@ -797,18 +800,24 @@ class DraftRunner(ModelRunner):
 
         _prof = os.environ.get("SSD_PROFILE", "0") == "1"
         payload["_all_greedy"] = bool((payload["temps"] == 0).all())
+        _step_times = []
         for depth in range(K):
-            if _prof:
+            if _prof or PROFILE_DRAFT:
                 torch.cuda.synchronize()
                 _st = time.perf_counter()
             current_input_ids = self._decode_tree_step(
                 depth, current_input_ids, step_rope_positions, step_slot_maps,
                 step_context_lens, dbt, payload, spec_tokens, spec_logits, spec_activations
             )
-            if _prof:
+            if _prof or PROFILE_DRAFT:
                 torch.cuda.synchronize()
                 _et = time.perf_counter()
-                print(f"[PROFILE draft] tree_step[{depth}]={(_et-_st)*1000:.2f}ms", flush=True)
+                _step_times.append((_et - _st) * 1000)
+                if _prof:
+                    print(f"[PROFILE draft] tree_step[{depth}]={_step_times[-1]:.2f}ms", flush=True)
+        if PROFILE_DRAFT and _step_times:
+            avg = sum(_step_times) / len(_step_times)
+            print(f"[PROFILE draft] tree_decode: K={K} steps={' '.join(f'{t:.2f}' for t in _step_times)} avg={avg:.2f}ms total={sum(_step_times):.2f}ms", flush=True)
 
         return spec_tokens, spec_logits, spec_activations
 
@@ -890,28 +899,28 @@ class DraftRunner(ModelRunner):
             elif cmd == 0:
                 _ds0 = time.perf_counter()
                 _prof = os.environ.get("SSD_PROFILE", "0") == "1"
-                if _prof:
+                if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d0 = time.perf_counter()
 
-                glue_decode_input_ids, partial_tree_decode_args = self._service_spec_request()  # ~3ms
+                glue_decode_input_ids, partial_tree_decode_args = self._service_spec_request()
 
-                if _prof:
+                if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d1 = time.perf_counter()
 
                 self._reset_tree_cache_tensors()
 
-                tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)  # ~3ms --> leaves ~28ms for decoding
+                tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
 
-                if _prof:
+                if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d2 = time.perf_counter()
 
                 # Decode the branch tree
                 tokens, logits, activations = self._decode_tree(tree_decode_args)
 
-                if _prof:
+                if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d3 = time.perf_counter()
 
@@ -919,10 +928,13 @@ class DraftRunner(ModelRunner):
                 self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
                 self._draft_step_times.append(time.perf_counter() - _ds0)
 
-                if _prof:
+                if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d4 = time.perf_counter()
                     print(f"[PROFILE draft] service={(_d1-_d0)*1000:.2f}ms build_tree={(_d2-_d1)*1000:.2f}ms decode_tree={(_d3-_d2)*1000:.2f}ms populate={(_d4-_d3)*1000:.2f}ms total={(_d4-_d0)*1000:.2f}ms", flush=True)
+
+                if PROFILE_DRAFT:
+                    flush_draft_profile()
 
                 continue
 

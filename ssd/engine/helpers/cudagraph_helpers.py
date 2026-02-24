@@ -92,11 +92,27 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
     if block_tables is not None:
         graph_vars["block_tables"][:bs, :block_tables.size(1)] = block_tables
 
-    graph.replay() # [1.35ms/1.85ms]
+    _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1"
+    if _pt:
+        torch.cuda.synchronize()
+        _t0 = perf_counter()
+
+    graph.replay()
+
+    if _pt:
+        torch.cuda.synchronize()
+        _t1 = perf_counter()
 
     # Extract outputs for the ORIGINAL batch size only
     outputs = graph_vars["outputs"][:orig_bs * k_plus_1]
     logits = model_runner.model.compute_logits(outputs, last_only)
+
+    if _pt:
+        torch.cuda.synchronize()
+        _t2 = perf_counter()
+        has_eagle = "eagle_acts" in graph_vars
+        print(f"[PROFILE verify_cg] replay={(_t1-_t0)*1000:.2f}ms logits={(_t2-_t1)*1000:.2f}ms eagle={has_eagle} bs={orig_bs} rank={model_runner.rank}", flush=True)
+
     # For eagle target, also return eagle_acts
     if "eagle_acts" in graph_vars:
         eagle_acts = graph_vars["eagle_acts"][:orig_bs * k_plus_1]
@@ -143,6 +159,26 @@ cache = {}
 
 _plan_event = None  # Lazy-init CUDA event for plan() sync
 PROFILE = os.environ.get("SSD_PROFILE", "0") == "1"
+PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
+_draft_events = []  # [(step, label, start_event, end_event), ...]
+
+def flush_draft_profile():
+    """Sync once, read all CUDA events, print per-step breakdown, clear list."""
+    if not _draft_events:
+        return
+    torch.cuda.synchronize()
+    by_step = {}
+    for step, label, ev0, ev1 in _draft_events:
+        by_step.setdefault(step, []).append((label, ev0.elapsed_time(ev1)))
+    parts = []
+    total = 0.0
+    for step in sorted(by_step):
+        step_total = sum(t for _, t in by_step[step])
+        detail = " ".join(f"{l}={t:.2f}" for l, t in by_step[step])
+        parts.append(f"s{step}={step_total:.2f}({detail})")
+        total += step_total
+    print(f"[PROFILE draft_detail] K={len(by_step)} total={total:.2f}ms avg_step={total/len(by_step):.2f}ms | {' '.join(parts)}", flush=True)
+    _draft_events.clear()
 
 @torch.inference_mode()
 def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, graph_vars, step, cache_hits, hidden_states=None):
@@ -327,6 +363,9 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         start_time.record()
 
     # Use precomputed CPU-packed masks (built at step 0)
+    if PROFILE_DRAFT:
+        _ev_mask0 = torch.cuda.Event(enable_timing=True); _ev_mask0.record()
+
     kv_indices = cache["precomputed_kv"][step]
     kv_indptr_cpu, kv_lpl_cpu = cache["plan_cpu_args"][step]
     qo_indptr_cpu = cache["cu_seqlens_q_cpu"]
@@ -352,6 +391,9 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     _plan_event.record()
     _plan_event.synchronize()
 
+    if PROFILE_DRAFT:
+        _ev_plan0 = torch.cuda.Event(enable_timing=True); _ev_plan0.record()
+
     plan_args = [
         wrapper._float_workspace_buffer, wrapper._int_workspace_buffer,
         wrapper._pin_memory_int_workspace_buffer,
@@ -366,6 +408,9 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     if wrapper._backend == "fa2":
         plan_args.extend([-1, False])
     wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
+
+    if PROFILE_DRAFT:
+        _ev_plan1 = torch.cuda.Event(enable_timing=True); _ev_plan1.record()
 
     if PROFILE:
         end_time.record()
@@ -393,7 +438,16 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         buffer_prep_time = start_time.elapsed_time(end_time)
         start_time.record()
 
+    if PROFILE_DRAFT:
+        _ev_replay0 = torch.cuda.Event(enable_timing=True); _ev_replay0.record()
+
     graph.replay()
+
+    if PROFILE_DRAFT:
+        _ev_replay1 = torch.cuda.Event(enable_timing=True); _ev_replay1.record()
+        _draft_events.append((step, "mask+buf", _ev_mask0, _ev_plan0))
+        _draft_events.append((step, "plan", _ev_plan0, _ev_plan1))
+        _draft_events.append((step, "replay", _ev_replay0, _ev_replay1))
 
     if PROFILE:
         end_time.record()

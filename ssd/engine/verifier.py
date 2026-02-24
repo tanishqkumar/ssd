@@ -61,12 +61,18 @@ class Verifier(VerifierBase):
             torch.cuda.synchronize()
             _vt0 = perf_counter()
 
+        _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1"
         _tv0 = perf_counter()
         result = self.target_model_runner.call("run", seqs, False, False, True)
 
         if _prof:
             torch.cuda.synchronize()
             _vt1 = perf_counter()
+
+        if _pt:
+            torch.cuda.synchronize()
+            _vt_call = perf_counter()
+            print(f"[PROFILE verifier] target_call={(_vt_call-_tv0)*1000:.2f}ms eagle={eagle} bs={batch_size}", flush=True)
 
         if eagle:
             logits_p_flat, eagle_acts_flat = result
