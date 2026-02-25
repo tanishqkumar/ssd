@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--port", type=int, default=40010)
     parser.add_argument("--size", type=str, default="70")
     parser.add_argument("--llama", action="store_true", default=True)
+    parser.add_argument("--qwen", action="store_true")
     parser.add_argument("--draft", type=str, default="1")
     parser.add_argument("--input_len", type=int, default=128)
     parser.add_argument("--output_len", type=int, default=512)
@@ -40,11 +41,15 @@ def main():
     parser.add_argument("--random", action="store_true")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--example", action="store_true")
+    parser.add_argument("--eagle", action="store_true")
+    parser.add_argument("--chat-template", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--group", type=str, default=None)
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.qwen:
+        args.llama = False
     seed(0)
 
     url = f"http://{args.host}:{args.port}"

@@ -1,3 +1,4 @@
+import sys
 import time
 import argparse
 import requests
@@ -11,6 +12,7 @@ def main():
     parser.add_argument("--port", type=int, default=40020)
     parser.add_argument("--size", type=str, default="70")
     parser.add_argument("--llama", action="store_true", default=True)
+    parser.add_argument("--qwen", action="store_true")
     parser.add_argument("--draft", type=str, default="1")
     parser.add_argument("--input_len", type=int, default=128)
     parser.add_argument("--output_len", type=int, default=512)
@@ -24,11 +26,15 @@ def main():
     parser.add_argument("--random", action="store_true")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--example", action="store_true")
+    parser.add_argument("--eagle", action="store_true")
+    parser.add_argument("--chat-template", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--group", type=str, default=None)
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.qwen:
+        args.llama = False
     seed(0)
 
     url = f"http://{args.host}:{args.port}"
@@ -39,6 +45,13 @@ def main():
     _, model_path, _ = get_model_paths(args)
     string_prompts, prompt_token_ids, _ = generate_benchmark_inputs(args, model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    # Use the model name the server actually serves (may differ from local path)
+    models_resp = requests.get(f"{url}/v1/models", timeout=10)
+    if models_resp.status_code == 200:
+        served_model = models_resp.json()["data"][0]["id"]
+    else:
+        served_model = model_path
 
     if string_prompts is not None:
         text_prompts = string_prompts
@@ -52,7 +65,7 @@ def main():
         import wandb
         wandb.init(project="ssd", group=args.group, name=args.name, config=vars(args))
 
-    payload = {"model": model_path, "prompt": text_prompts[0], "max_tokens": args.output_len,
+    payload = {"model": served_model, "prompt": text_prompts[0], "max_tokens": args.output_len,
                "temperature": args.temp, "ignore_eos": True}
     requests.post(f"{url}/v1/completions", json=payload, timeout=120)
     print("Warmup done")
@@ -70,7 +83,7 @@ def main():
 
         batch_start = time.time()
         for prompt in batch:
-            payload = {"model": model_path, "prompt": prompt, "max_tokens": args.output_len,
+            payload = {"model": served_model, "prompt": prompt, "max_tokens": args.output_len,
                        "temperature": args.temp, "ignore_eos": True}
             resp = requests.post(f"{url}/v1/completions", json=payload, timeout=300)
             assert resp.status_code == 200, f"Request failed: {resp.status_code} {resp.text}"
