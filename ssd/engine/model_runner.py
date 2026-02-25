@@ -30,8 +30,8 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_verify_cudagraph,
     capture_fi_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
-    get_custom_mask,
 )
+from ssd.engine.helpers.mask_helpers import get_custom_mask
     
 
 class ModelRunner:
@@ -281,10 +281,6 @@ class ModelRunner:
         if self.verbose:
             print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
         self.allocate_kv_cache()
-        if init_q is not None:
-            # super().__init__() runs warmup and calculates num_kvcache_blocks, pass that up
-            init_q.put(self.config.num_kvcache_blocks)
-            init_q.close()
 
         if not self.enforce_eager:
             # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate): 
@@ -311,6 +307,14 @@ class ModelRunner:
                 self.graph_pools["glue_decode"] = glue_pool
                 self.graphs["glue_decode"] = glue_graphs
                 self.graph_bs_list["glue_decode"] = glue_bs_list
+
+        if init_q is not None:
+            # Signal the scheduler that we're fully initialized (model loaded,
+            # KV cache allocated, CUDA graphs captured).  Must happen after
+            # CUDA graph capture so the scheduler doesn't send NCCL requests
+            # before the draft runner enters its recv loop.
+            init_q.put(self.config.num_kvcache_blocks)
+            init_q.close()
 
         return model_type
 
@@ -515,7 +519,7 @@ class ModelRunner:
             num_kv_heads,
             hf_config.head_dim, 
         )
-        
+
         print(f"allocate_kv_cache(): kv_cache shape = {self.kv_cache.shape}", flush=True)
         layer_id = 0
         for module in self.model.modules():

@@ -1,43 +1,10 @@
 import os
+import math
 import torch
 import numpy as np
-from typing import List
+
 from ssd.utils.context import set_context, get_context, reset_context
-from ssd.engine.helpers.mask_helpers import get_custom_mask
-from flashinfer.quantization import get_quantization_module
 from time import perf_counter
-
-
-# PERFORMANCE: CPU-side mask indptr avoids GPU->CPU sync inside FlashInfer plan().
-# Replicates FlashInfer's _compute_page_mask_indptr using only CPU tensors.
-def _compute_page_mask_indptr_cpu(qo_indptr, paged_kv_indptr, paged_kv_last_page_len, page_size):
-    mask_indptr = torch.empty_like(qo_indptr)
-    mask_indptr[0] = 0
-    mask_indptr[1:] = torch.cumsum(
-        (qo_indptr[1:] - qo_indptr[:-1])
-        * ((paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size + paged_kv_last_page_len),
-        0,
-    )
-    return mask_indptr
-
-
-# PERFORMANCE: segment_packbits with CPU-computed metadata avoids GPU->CPU .item() sync.
-# FlashInfer's segment_packbits calls indptr_new[-1].item() on a GPU tensor = sync point.
-# We compute indptr_new on CPU first, then transfer to GPU async.
-def _segment_packbits_no_sync(x_gpu, mask_indptr_cpu, bitorder="little"):
-    device = x_gpu.device
-    indptr_cpu = mask_indptr_cpu.to(torch.int32)
-    seglen = indptr_cpu[1:] - indptr_cpu[:-1]
-    packed_len = (seglen + 7) // 8
-    indptr_new_cpu = torch.zeros(len(indptr_cpu), dtype=torch.int32)
-    indptr_new_cpu[1:] = torch.cumsum(packed_len, 0)
-    output_nnzs = int(indptr_new_cpu[-1].item())
-    indptr_gpu = indptr_cpu.to(device, non_blocking=True)
-    indptr_new_gpu = indptr_new_cpu.to(device, non_blocking=True)
-    y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
-    get_quantization_module().segment_packbits(x_gpu, indptr_gpu, indptr_new_gpu, bitorder, y)
-    return y, indptr_new_gpu
-
 
 
 ## RUN CUDAGRAPHS
@@ -489,9 +456,9 @@ def capture_cudagraph(model_runner):
     block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
     outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
-    graph_bs_list = [1, 2, 4, 8] + \
-        list(range(16, max_bs + 1, 16))
-    if max_bs % 16 != 0:
+    # Capture graphs for all powers of 2 up to max_bs
+    graph_bs_list = [2**i for i in range(int(math.log2(max_bs)) + 1)]
+    if graph_bs_list[-1] != max_bs:
         graph_bs_list.append(max_bs)
 
     # make sure N is in graph_bs
@@ -524,7 +491,10 @@ def capture_cudagraph(model_runner):
         hidden_states = torch.zeros(max_bs, hf_config.hidden_size,
                                     dtype=hf_config.torch_dtype, device=input_ids.device)
 
-    for bs in reversed(graph_bs_list):
+    total_graphs = len(graph_bs_list)
+    print(f'[capture_cudagraph] Starting capture of {total_graphs} graphs, bs list: {graph_bs_list[:5]}...{graph_bs_list[-3:]} max_bs={max_bs}', flush=True)
+    for idx, bs in enumerate(reversed(graph_bs_list)):
+        print(f'[capture_cudagraph] Capturing graph {idx+1}/{total_graphs}, bs={bs}', flush=True)
         graph = torch.cuda.CUDAGraph()
         set_context(
             False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], is_jit=is_jit)

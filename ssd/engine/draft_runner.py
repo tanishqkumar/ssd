@@ -12,6 +12,7 @@ from ssd.utils.async_helpers.nccl_pack import recv_int64
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 
 ttl = 0
 ttl_hit = 0
@@ -68,9 +69,12 @@ class DraftRunner(ModelRunner):
         fused_total = total_new_tokens + batch_size + batch_size * max_blocks
         fused = recv_int64(self.async_pg, src=0, total_length=fused_total, device=self.device)
         off = 0
-        input_ids = fused[off:off + total_new_tokens]; off += total_new_tokens
-        num_tokens = fused[off:off + batch_size]; off += batch_size
-        draft_block_table = fused[off:off + batch_size * max_blocks].view(batch_size, max_blocks).to(torch.int32); off += batch_size * max_blocks
+        input_ids = fused[off:off + total_new_tokens]
+        off += total_new_tokens
+        num_tokens = fused[off:off + batch_size]
+        off += batch_size
+        draft_block_table = fused[off:off + batch_size * max_blocks].view(batch_size, max_blocks).to(torch.int32)
+        off += batch_size * max_blocks
         assert off == fused_total
 
         eagle_acts = None
@@ -79,6 +83,16 @@ class DraftRunner(ModelRunner):
                 total_new_tokens, eagle_act_dim, dtype=self.hf_config.torch_dtype, device=self.device,
             )
             dist.recv(eagle_acts, src=0, group=self.async_pg)
+
+        if NCCL_LOG:
+            sep = '=' * 80
+            print(f"\n{sep}", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] input_ids shape={input_ids.shape}, values={input_ids.tolist()}", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] input_ids decoded='{self.tokenizer.decode(input_ids.cpu().tolist())}'", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] num_tokens={num_tokens.tolist()}", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
+            print(f"{sep}\n", flush=True)
 
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
 
@@ -313,6 +327,20 @@ class DraftRunner(ModelRunner):
         assert off == fused_total
         temperatures = temps_as_int64.to(torch.int32).view(torch.float32)
 
+        if NCCL_LOG:
+            sep = '=' * 80
+            print(f"\n{sep}", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_SPEC] meta=[B={B}, K={K}, F={F}]", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_SPEC] cache_keys shape={cache_keys.shape}", flush=True)
+            for i in range(B):
+                seq_id, accept_len, verified_id = cache_keys[i].tolist()
+                verified_text = self.tokenizer.decode([int(verified_id)])
+                print(f"  req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={int(verified_id)} ('{verified_text}')", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_SPEC] num_tokens={num_tokens.tolist()}", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_SPEC] draft_block_tables shape={draft_block_tables.shape}, values={draft_block_tables.tolist()}", flush=True)
+            print(f"[NCCL_LOG DRAFT_RECV_SPEC] temperatures={temperatures.tolist()}", flush=True)
+            print(f"{sep}\n", flush=True)
+
         target_recovery_activations = torch.zeros(
             B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
         ) if self.config.use_eagle else None
@@ -362,6 +390,19 @@ class DraftRunner(ModelRunner):
             print(f"", flush=True)
 
         fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
+
+        if NCCL_LOG:
+            sep = '=' * 80
+            print(f"\n{sep}", flush=True)
+            print(f"[NCCL_LOG DRAFT_SEND_RESP] B={B}, K={K}", flush=True)
+            print(f"[NCCL_LOG DRAFT_SEND_RESP] cache_hits={cache_hits.tolist()}", flush=True)
+            for i in range(B):
+                spec_ids = out_tokens[i, :K].tolist()
+                spec_text = [self.tokenizer.decode([t]) for t in spec_ids]
+                print(f"  req[{i}]: speculations={spec_ids}", flush=True)
+                print(f"           decoded={spec_text}", flush=True)
+            print(f"{sep}\n", flush=True)
+
         dist.send(fused_response, dst=0, group=self.async_pg)
         dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
 

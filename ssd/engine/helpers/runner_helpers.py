@@ -1,9 +1,42 @@
 from typing import Any
+import os
 import torch
 import torch.distributed as dist
 
 from ssd.engine.sequence import Sequence
 from ssd.utils.async_helpers.nccl_pack import send_int64, recv_int64
+
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+_nccl_tokenizer = None
+
+def _get_nccl_tokenizer():
+    global _nccl_tokenizer
+    if _nccl_tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+            _nccl_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        except Exception as e:
+            print(f"[NCCL_LOG] Failed to load tokenizer: {e}", flush=True)
+            return None
+    return _nccl_tokenizer
+
+def _decode_ids(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return "<no tokenizer>"
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return tok.decode(ids)
+
+def _decode_id_list(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return []
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return [tok.decode([t]) for t in ids]
 
 
 def send_speculation_request(
@@ -16,6 +49,22 @@ def send_speculation_request(
     async_pg: dist.ProcessGroup,
     draft_runner_rank: int,
 ):
+    if NCCL_LOG:
+        B = meta[0].item()
+        K = meta[1].item()
+        F = meta[2].item()
+        sep = '=' * 80
+        print(f"\n{sep}", flush=True)
+        print(f"[NCCL_LOG SEND_SPEC] cmd={cmd.tolist()}, meta=[B={B}, K={K}, F={F}]", flush=True)
+        print(f"[NCCL_LOG SEND_SPEC] cache_keys shape={cache_keys.shape}", flush=True)
+        for i in range(B):
+            seq_id, accept_len, verified_id = cache_keys[i].tolist()
+            verified_text = _decode_ids(cache_keys[i, 2])
+            print(f"  req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={verified_id} ('{verified_text}')", flush=True)
+        print(f"[NCCL_LOG SEND_SPEC] num_tokens={num_tokens.tolist()}", flush=True)
+        print(f"[NCCL_LOG SEND_SPEC] block_tables shape={block_tables.shape}, values={block_tables.tolist()}", flush=True)
+        print(f"[NCCL_LOG SEND_SPEC] temps={temps.tolist()}", flush=True)
+        print(f"{sep}\n", flush=True)
     dist.send(cmd, dst=draft_runner_rank, group=async_pg)
     dist.send(meta, dst=draft_runner_rank, group=async_pg)
     send_int64(
@@ -43,6 +92,18 @@ def receive_speculation_response(
     speculations = fused_response[B:].view(B, K)
     if not skip_logits:
         dist.recv(logits_q, src=draft_runner_rank, group=async_pg)
+    if NCCL_LOG:
+        sep = '=' * 80
+        print(f"\n{sep}", flush=True)
+        print(f"[NCCL_LOG RECV_SPEC_RESP] B={B}, K={K}", flush=True)
+        print(f"[NCCL_LOG RECV_SPEC_RESP] cache_hits={cache_hits.tolist()}", flush=True)
+        for i in range(B):
+            spec_ids = speculations[i].tolist()
+            spec_text = _decode_id_list(speculations[i])
+            print(f"  req[{i}]: speculations={spec_ids}", flush=True)
+            print(f"           decoded={spec_text}", flush=True)
+        print(f"[NCCL_LOG RECV_SPEC_RESP] skip_logits={skip_logits}", flush=True)
+        print(f"{sep}\n", flush=True)
     return speculations, logits_q, cache_hits
 
 def prepare_prefill_metadata(
@@ -73,6 +134,17 @@ def send_prefill_request(
     draft_process_group: dist.ProcessGroup,
     draft_runner_rank: int,
 ):
+    if NCCL_LOG:
+        sep = '=' * 80
+        print(f"\n{sep}", flush=True)
+        print(f"[NCCL_LOG SEND_PREFILL] cmd={cmd.tolist()}", flush=True)
+        print(f"[NCCL_LOG SEND_PREFILL] metadata={metadata.tolist()}", flush=True)
+        print(f"[NCCL_LOG SEND_PREFILL] input_ids shape={input_ids.shape}, values={input_ids.tolist()}", flush=True)
+        print(f"[NCCL_LOG SEND_PREFILL] input_ids decoded='{_decode_ids(input_ids)}'", flush=True)
+        print(f"[NCCL_LOG SEND_PREFILL] num_tokens={num_tokens.tolist()}", flush=True)
+        print(f"[NCCL_LOG SEND_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+        print(f"[NCCL_LOG SEND_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
+        print(f"{sep}\n", flush=True)
     dist.send(cmd, dst=draft_runner_rank, group=draft_process_group)
     dist.send(metadata, dst=draft_runner_rank, group=draft_process_group)
     send_int64(
