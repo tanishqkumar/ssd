@@ -4,40 +4,7 @@ import numpy as np
 from typing import List
 from ssd.utils.context import set_context, get_context, reset_context
 from ssd.engine.helpers.mask_helpers import get_custom_mask
-from flashinfer.quantization import get_quantization_module
 from time import perf_counter
-
-
-# PERFORMANCE: CPU-side mask indptr avoids GPU->CPU sync inside FlashInfer plan().
-# Replicates FlashInfer's _compute_page_mask_indptr using only CPU tensors.
-def _compute_page_mask_indptr_cpu(qo_indptr, paged_kv_indptr, paged_kv_last_page_len, page_size):
-    mask_indptr = torch.empty_like(qo_indptr)
-    mask_indptr[0] = 0
-    mask_indptr[1:] = torch.cumsum(
-        (qo_indptr[1:] - qo_indptr[:-1])
-        * ((paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size + paged_kv_last_page_len),
-        0,
-    )
-    return mask_indptr
-
-
-# PERFORMANCE: segment_packbits with CPU-computed metadata avoids GPU->CPU .item() sync.
-# FlashInfer's segment_packbits calls indptr_new[-1].item() on a GPU tensor = sync point.
-# We compute indptr_new on CPU first, then transfer to GPU async.
-def _segment_packbits_no_sync(x_gpu, mask_indptr_cpu, bitorder="little"):
-    device = x_gpu.device
-    indptr_cpu = mask_indptr_cpu.to(torch.int32)
-    seglen = indptr_cpu[1:] - indptr_cpu[:-1]
-    packed_len = (seglen + 7) // 8
-    indptr_new_cpu = torch.zeros(len(indptr_cpu), dtype=torch.int32)
-    indptr_new_cpu[1:] = torch.cumsum(packed_len, 0)
-    output_nnzs = int(indptr_new_cpu[-1].item())
-    indptr_gpu = indptr_cpu.to(device, non_blocking=True)
-    indptr_new_gpu = indptr_new_cpu.to(device, non_blocking=True)
-    y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
-    get_quantization_module().segment_packbits(x_gpu, indptr_gpu, indptr_new_gpu, bitorder, y)
-    return y, indptr_new_gpu
-
 
 
 ## RUN CUDAGRAPHS
