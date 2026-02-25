@@ -33,6 +33,7 @@ class Config:
     sampler_x: float | None = None 
     jit_speculate: bool = False
     async_nccl_port: int | None = None
+    skip_return_logits: bool = False
 
     # eagle3
     use_eagle: bool = False 

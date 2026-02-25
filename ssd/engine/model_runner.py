@@ -499,7 +499,7 @@ class ModelRunner:
             usable_bytes = max(usable_bytes - reserved_bytes, 0)
             assert usable_bytes > 0, "ERROR: Not enough memory for draft KV cache after accounting for tree_cache for logits storage"
 
-        if config.num_kvcache_blocks is not None:
+        if config.num_kvcache_blocks is not None and config.num_kvcache_blocks > 0:
             config.num_kvcache_blocks = min(config.num_kvcache_blocks, int(usable_bytes) // block_bytes)
         else:
             config.num_kvcache_blocks = int(usable_bytes) // block_bytes

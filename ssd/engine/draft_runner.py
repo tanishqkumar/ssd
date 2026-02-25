@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime
 import torch
 import torch.distributed as dist
 import dataclasses
@@ -13,6 +14,11 @@ from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+
+
+def _ts():
+    return f'[[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}]]'
+
 
 ttl = 0
 ttl_hit = 0
@@ -46,13 +52,13 @@ class DraftRunner(ModelRunner):
             self._reset_tree_cache_tensors()
             self._init_prealloc_buffers()
             self._draft_step_times = []
-            print(f'DraftRunner set up, starting draft_loop', flush=True)
+            print(f'[{_ts()}] DraftRunner set up, starting draft_loop', flush=True)
             self.draft_loop()
 
     def draft_async_prefill(self):
         assert self.draft_async and self.is_draft
 
-        print(f'[draft_async_prefill] DRAFT ASYNC PREFILL STARTING', flush=True)
+        print(f'[{_ts()}] [draft_async_prefill] DRAFT ASYNC PREFILL STARTING', flush=True)
 
         # 1) Receive metadata then individual tensors
         # First recv metadata to learn sizes
@@ -63,7 +69,7 @@ class DraftRunner(ModelRunner):
             assert eagle_act_dim == 3 * self.config.d_model_target, (
                 f"EAGLE activation dimension {eagle_act_dim} does not match expected dimension 3 * {self.config.d_model_target}"
             )
-        print(f'[draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, batch_size={batch_size}, max_blocks={max_blocks}, use_eagle={use_eagle}, eagle_act_dim={eagle_act_dim}', flush=True)
+        print(f'[{_ts()}] [draft_async_prefill] METADATA: total_new_tokens={total_new_tokens}, batch_size={batch_size}, max_blocks={max_blocks}, use_eagle={use_eagle}, eagle_act_dim={eagle_act_dim}', flush=True)
 
         # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
         fused_total = total_new_tokens + batch_size + batch_size * max_blocks
@@ -86,13 +92,13 @@ class DraftRunner(ModelRunner):
 
         if NCCL_LOG:
             sep = '=' * 80
-            print(f"\n{sep}", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] input_ids shape={input_ids.shape}, values={input_ids.tolist()}", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] input_ids decoded='{self.tokenizer.decode(input_ids.cpu().tolist())}'", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] num_tokens={num_tokens.tolist()}", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
-            print(f"{sep}\n", flush=True)
+            print(f"[{_ts()}] \n{sep}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] input_ids shape={input_ids.shape}, values={input_ids.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] input_ids decoded='{self.tokenizer.decode(input_ids.cpu().tolist())}'", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] num_tokens={num_tokens.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
+            print(f"[{_ts()}] {sep}\n", flush=True)
 
         prefill_ctxt = self.prepare_prefill_ctxt(num_tokens, draft_block_table)
 
@@ -114,7 +120,7 @@ class DraftRunner(ModelRunner):
         else:
             self.run_model(input_ids, positions, is_prefill=True, last_only=True, hidden_states=eagle_acts)
 
-        print(f'[draft_async_prefill] DRAFT ASYNC PREFILL DONE', flush=True)
+        print(f'[{_ts()}] [draft_async_prefill] DRAFT ASYNC PREFILL DONE', flush=True)
         # 7) clean up
         reset_context()
 
@@ -224,11 +230,11 @@ class DraftRunner(ModelRunner):
         ttl += int(B)
         
         if self.config.verbose:
-            print(f"[hit_cache_and_respond] Request keys: {request_keys}", flush=True)
+            print(f"[{_ts()}] [hit_cache_and_respond] Request keys: {request_keys}", flush=True)
             for i in range(B):
                 rec_token = request_keys[i, 2].item()
                 rec_text = self.tokenizer.decode([rec_token])
-                print(f"  Req {i}: token={rec_token} ('{rec_text}')", flush=True)
+                print(f"[{_ts()}]   Req {i}: token={rec_token} ('{rec_text}')", flush=True)
         
         if self.tree_cache_keys.numel() > 0:
             # Vectorized membership against tensor cache
@@ -238,8 +244,8 @@ class DraftRunner(ModelRunner):
             ttl_hit += int(cache_hits.sum().item())
             
             if self.config.verbose:
-                print(f"[hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
-                print(f"[hit_cache_and_respond] Cache: {self.tree_cache_keys.shape[0]} entries", flush=True)
+                print(f"[{_ts()}] [hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
+                print(f"[{_ts()}] [hit_cache_and_respond] Cache: {self.tree_cache_keys.shape[0]} entries", flush=True)
                 
                 # Build set of hit cache indices for marking
                 hit_indices = set()
@@ -254,7 +260,7 @@ class DraftRunner(ModelRunner):
                     seq_id, k_idx, rec_token = key.tolist()
                     rec_text = self.tokenizer.decode([rec_token])
                     hit_marker = "[HIT]" if i in hit_indices else ""
-                    print(f"    [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
+                    print(f"[{_ts()}]     [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
             
             # Fill hits
             if (cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate):
@@ -271,7 +277,7 @@ class DraftRunner(ModelRunner):
             elif self.config.jit_speculate: 
                 # print(f'[hit_cache_and_respond] found a cache miss, running jit speculate', flush=True)
                 if self.config.verbose:
-                    print(f"[hit_cache_and_respond] Running JIT speculate for cache misses", flush=True)
+                    print(f"[{_ts()}] [hit_cache_and_respond] Running JIT speculate for cache misses", flush=True)
                 jit_acts = self.jit_speculate(
                     request_keys, 
                     num_tokens, 
@@ -286,7 +292,7 @@ class DraftRunner(ModelRunner):
         elif self.config.jit_speculate:
             # Cache is empty (first iteration), must JIT all
             if self.config.verbose:
-                print(f"[hit_cache_and_respond] Cache empty, running JIT speculate for all", flush=True)
+                print(f"[{_ts()}] [hit_cache_and_respond] Cache empty, running JIT speculate for all", flush=True)
             jit_acts = self.jit_speculate(
                 request_keys, 
                 num_tokens, 
@@ -329,17 +335,17 @@ class DraftRunner(ModelRunner):
 
         if NCCL_LOG:
             sep = '=' * 80
-            print(f"\n{sep}", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_SPEC] meta=[B={B}, K={K}, F={F}]", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_SPEC] cache_keys shape={cache_keys.shape}", flush=True)
+            print(f"[{_ts()}] \n{sep}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] meta=[B={B}, K={K}, F={F}]", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] cache_keys shape={cache_keys.shape}", flush=True)
             for i in range(B):
                 seq_id, accept_len, verified_id = cache_keys[i].tolist()
                 verified_text = self.tokenizer.decode([int(verified_id)])
-                print(f"  req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={int(verified_id)} ('{verified_text}')", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_SPEC] num_tokens={num_tokens.tolist()}", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_SPEC] draft_block_tables shape={draft_block_tables.shape}, values={draft_block_tables.tolist()}", flush=True)
-            print(f"[NCCL_LOG DRAFT_RECV_SPEC] temperatures={temperatures.tolist()}", flush=True)
-            print(f"{sep}\n", flush=True)
+                print(f"[{_ts()}]   req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={int(verified_id)} ('{verified_text}')", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] num_tokens={num_tokens.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] draft_block_tables shape={draft_block_tables.shape}, values={draft_block_tables.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_RECV_SPEC] temperatures={temperatures.tolist()}", flush=True)
+            print(f"[{_ts()}] {sep}\n", flush=True)
 
         target_recovery_activations = torch.zeros(
             B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
@@ -363,48 +369,49 @@ class DraftRunner(ModelRunner):
 
             if self.config.verbose:
                 recovery_tokens_target = cache_keys[:, 2].clone()
-                print(f"\n{'='*80}", flush=True)
-                print(f"[CACHE REQUEST] Batch size: {B}, Spec depth: {K}", flush=True)
+                print(f"[{_ts()}] \n{'='*80}", flush=True)
+                print(f"[{_ts()}] [CACHE REQUEST] Batch size: {B}, Spec depth: {K}", flush=True)
                 for i in range(B):
                     seq_id = cache_keys[i, 0].item()
                     keep_idx = cache_keys[i, 1].item()
                     rec_token_target = recovery_tokens_target[i].item()
                     rec_token_text = self.tokenizer.decode([rec_token_target])
                     n_ext = extend_counts[i].item()
-                    print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
-                print(f"{'='*80}\n", flush=True)
+                    print(f"[{_ts()}]   Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
+                print(f"[{_ts()}] {'='*80}\n", flush=True)
 
         out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
             cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
 
         if self.config.verbose:
-            print(f"[CACHE RESPONSE]", flush=True)
+            print(f"[{_ts()}] [CACHE RESPONSE]", flush=True)
             for i in range(B):
                 hit_status = "HIT" if cache_hits[i].item() == 1 else "MISS"
-                print(f"  Seq {cache_keys[i, 0].item()}: {hit_status}", flush=True)
+                print(f"[{_ts()}]   Seq {cache_keys[i, 0].item()}: {hit_status}", flush=True)
                 if cache_hits[i].item() == 1 or self.config.jit_speculate:
                     tokens_list = out_tokens[i, :K].tolist()
                     tokens_text = [self.tokenizer.decode([t]) for t in tokens_list]
-                    print(f"    Tokens: {tokens_list}", flush=True)
-                    print(f"    Detokenized: {tokens_text}", flush=True)
-            print(f"", flush=True)
+                    print(f"[{_ts()}]     Tokens: {tokens_list}", flush=True)
+                    print(f"[{_ts()}]     Detokenized: {tokens_text}", flush=True)
+            print(f"[{_ts()}] ", flush=True)
 
         fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
 
         if NCCL_LOG:
             sep = '=' * 80
-            print(f"\n{sep}", flush=True)
-            print(f"[NCCL_LOG DRAFT_SEND_RESP] B={B}, K={K}", flush=True)
-            print(f"[NCCL_LOG DRAFT_SEND_RESP] cache_hits={cache_hits.tolist()}", flush=True)
+            print(f"[{_ts()}] \n{sep}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_SEND_RESP] B={B}, K={K}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG DRAFT_SEND_RESP] cache_hits={cache_hits.tolist()}", flush=True)
             for i in range(B):
                 spec_ids = out_tokens[i, :K].tolist()
                 spec_text = [self.tokenizer.decode([t]) for t in spec_ids]
-                print(f"  req[{i}]: speculations={spec_ids}", flush=True)
-                print(f"           decoded={spec_text}", flush=True)
-            print(f"{sep}\n", flush=True)
+                print(f"[{_ts()}]   req[{i}]: speculations={spec_ids}", flush=True)
+                print(f"[{_ts()}]            decoded={spec_text}", flush=True)
+            print(f"[{_ts()}] {sep}\n", flush=True)
 
         dist.send(fused_response, dst=0, group=self.async_pg)
-        dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
+        if not self.config.skip_return_logits:
+            dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
 
         partial_tree_decode_args = {
             "num_tokens": num_tokens,
@@ -574,7 +581,7 @@ class DraftRunner(ModelRunner):
 
     def _build_tree_batch(self, partial_tree_decode_args, glue_decode_input_ids):
         if self.config.verbose:
-            print(f'about to build tree batch')
+            print(f'[{_ts()}] about to build tree batch')
         K = self.config.speculate_k
         dbt = partial_tree_decode_args["dbt"]
         cache_hits = partial_tree_decode_args["cache_hits"]
@@ -849,10 +856,10 @@ class DraftRunner(ModelRunner):
                 _et = time.perf_counter()
                 _step_times.append((_et - _st) * 1000)
                 if _prof:
-                    print(f"[PROFILE draft] tree_step[{depth}]={_step_times[-1]:.2f}ms", flush=True)
+                    print(f"[{_ts()}] [PROFILE draft] tree_step[{depth}]={_step_times[-1]:.2f}ms", flush=True)
         if PROFILE_DRAFT and _step_times:
             avg = sum(_step_times) / len(_step_times)
-            print(f"[PROFILE draft] tree_decode: K={K} steps={' '.join(f'{t:.2f}' for t in _step_times)} avg={avg:.2f}ms total={sum(_step_times):.2f}ms", flush=True)
+            print(f"[{_ts()}] [PROFILE draft] tree_decode: K={K} steps={' '.join(f'{t:.2f}' for t in _step_times)} avg={avg:.2f}ms total={sum(_step_times):.2f}ms", flush=True)
 
         return spec_tokens, spec_logits, spec_activations
 
@@ -877,8 +884,8 @@ class DraftRunner(ModelRunner):
         # Print cache population details
         if self.config.verbose:
             N = keys.shape[0]
-            print(f"\n{'='*80}", flush=True)
-            print(f"[CACHE POPULATED] {N} entries", flush=True)
+            print(f"[{_ts()}] \n{'='*80}", flush=True)
+            print(f"[{_ts()}] [CACHE POPULATED] {N} entries", flush=True)
             
             # Show sample entries per sequence
             for seq_id in keys[:, 0].unique()[:1]:  # Just show first sequence
@@ -886,7 +893,7 @@ class DraftRunner(ModelRunner):
                 seq_entries = keys[seq_mask]
                 seq_tokens = tokens[seq_mask]
                 
-                print(f"  Seq {seq_id.item()}: {seq_mask.sum().item()} entries", flush=True)
+                print(f"[{_ts()}]   Seq {seq_id.item()}: {seq_mask.sum().item()} entries", flush=True)
                 
                 # Show first 2 unique recovery tokens
                 for rec_token in seq_entries[:, 2].unique()[:2]:
@@ -898,8 +905,8 @@ class DraftRunner(ModelRunner):
                         rec_text = self.tokenizer.decode([rec_token.item()])
                         spec_tokens = seq_tokens[idx].tolist()
                         spec_text = [self.tokenizer.decode([t]) for t in spec_tokens]
-                        print(f"    k={k_idx}, rec={rec_token.item()} ('{rec_text}') -> {spec_text}", flush=True)
-            print(f"{'='*80}\n", flush=True)
+                        print(f"[{_ts()}]     k={k_idx}, rec={rec_token.item()} ('{rec_text}') -> {spec_text}", flush=True)
+            print(f"[{_ts()}] {'='*80}\n", flush=True)
     
     def _start_interrupt_listener(self):
         """Initiates a non-blocking receive for the next command to allow interruption."""
@@ -962,7 +969,7 @@ class DraftRunner(ModelRunner):
                 if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d4 = time.perf_counter()
-                    print(f"[PROFILE draft] service={(_d1-_d0)*1000:.2f}ms build_tree={(_d2-_d1)*1000:.2f}ms decode_tree={(_d3-_d2)*1000:.2f}ms populate={(_d4-_d3)*1000:.2f}ms total={(_d4-_d0)*1000:.2f}ms", flush=True)
+                    print(f"[{_ts()}] [PROFILE draft] service={(_d1-_d0)*1000:.2f}ms build_tree={(_d2-_d1)*1000:.2f}ms decode_tree={(_d3-_d2)*1000:.2f}ms populate={(_d4-_d3)*1000:.2f}ms total={(_d4-_d0)*1000:.2f}ms", flush=True)
 
                 if PROFILE_DRAFT:
                     flush_draft_profile()
@@ -973,7 +980,7 @@ class DraftRunner(ModelRunner):
             elif cmd == 2:
                 if self._draft_step_times:
                     avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
-                    print(f"[metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
+                    print(f"[{_ts()}] [metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
                 self.exit()
                 break
 
