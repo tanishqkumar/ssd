@@ -671,11 +671,7 @@ def plot_results(all_results_sweep1, all_results_sweep2, target_size, f_values, 
     fig.patch.set_facecolor('white')
     plt.tight_layout(pad=4.0)
 
-<<<<<<< HEAD
-    plot_dir = '/home/tkumar/async-spec/scripts/plots/camera'
-=======
     plot_dir = '/home/tkumar/ssd/scripts/plots/camera'
->>>>>>> main
     os.makedirs(plot_dir, exist_ok=True)
 
     temp_strs = set()
