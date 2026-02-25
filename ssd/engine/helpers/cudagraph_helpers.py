@@ -489,25 +489,25 @@ def capture_cudagraph(model_runner):
     block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
     outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
-    graph_bs_list = [1, 2, 4, 8] + \
-        list(range(16, max_bs + 1, 16))
-    if max_bs % 16 != 0:
-        graph_bs_list.append(max_bs)
-
-    # make sure N is in graph_bs
     if model_runner.config.speculate and model_runner.config.draft_async and model_runner.is_draft:
-        N = max_seqs * (model_runner.config.speculate_k + 1) * \
-            model_runner.config.async_fan_out
-        tree_decode_bs = N
-        if tree_decode_bs not in graph_bs_list:
-            # Insert in the correct position to maintain sorted order
-            insert_pos = 0
-            for i, bs in enumerate(graph_bs_list):
-                if bs > tree_decode_bs:
-                    insert_pos = i
-                    break
-                insert_pos = i + 1
-            graph_bs_list.insert(insert_pos, tree_decode_bs)
+        # Power-of-two buckets: max_bs = max_seqs*(K+1)^2*F can be huge (e.g. 9600 for k=9,f=3,B=32),
+        # linear step-16 would create ~600 graphs. Power-of-two gives ~15.
+        N = max_seqs * (model_runner.config.speculate_k + 1) * model_runner.config.async_fan_out
+        graph_bs_list = []
+        bs = 1
+        while bs < max_bs:
+            graph_bs_list.append(bs)
+            bs *= 2
+        if max_bs not in graph_bs_list:
+            graph_bs_list.append(max_bs)
+        # Ensure N (tree decode batch size) is a bucket for exact-fit replay
+        if N not in graph_bs_list:
+            graph_bs_list.append(N)
+            graph_bs_list.sort()
+    else:
+        graph_bs_list = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        if max_bs % 16 != 0:
+            graph_bs_list.append(max_bs)
 
     graphs = {}
     graph_pool = None
