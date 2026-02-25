@@ -13,7 +13,7 @@ from bench_helpers import get_model_paths, generate_benchmark_inputs
 
 def parse_arguments():
     """Parse command line arguments for benchmarking."""
-    parser = argparse.ArgumentParser(description="Benchmark nano-vLLM performance (API similar to example.py)")
+    parser = argparse.ArgumentParser(description="Benchmark SSD performance (API similar to example.py)")
     
     # Model configuration
     parser.add_argument("--size", type=str, choices=["0.6", "1.7", "4", "8", "14", "32", "1", "3", "70"], default="4", 
@@ -118,7 +118,7 @@ def initialize_wandb(args, run_name):
         return
     
     wandb.init(
-        project="async-spec",
+        project="ssd",
         name=run_name,
         group=args.group,
         config={
@@ -148,7 +148,7 @@ def initialize_wandb(args, run_name):
             "random_mode": args.random,
             "all_mode": args.all,
             "sampler_x": args.x,
-            "implementation": "nanovllm-internal",
+            "implementation": "ssd",
             "max_steps": args.max_steps,
         }
     )

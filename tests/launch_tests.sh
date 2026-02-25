@@ -28,7 +28,7 @@ cd /home/tkumar/ssd
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
 export PYTHONPATH=/home/tkumar/ssd
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B AR temp=0 ==='
 python -O bench/bench.py --size 70 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0
@@ -49,7 +49,7 @@ cd /home/tkumar/ssd
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
 export PYTHONPATH=/home/tkumar/ssd
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=1 ns=8 temp=0 ==='
 python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0
@@ -70,7 +70,7 @@ cd /home/tkumar/ssd
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
 export PYTHONPATH=/home/tkumar/ssd
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=2 temp=0 ==='
 python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 2 --backup jit --numseqs 8 --output_len 512 --temp 0
@@ -93,7 +93,7 @@ cd /home/tkumar/ssd
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
 export PYTHONPATH=/home/tkumar/ssd
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=16 temp=0 ==='
 python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 16 --backup jit --numseqs 64 --output_len 512 --temp 0
@@ -112,7 +112,7 @@ cd /home/tkumar/ssd
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
 export PYTHONPATH=/home/tkumar/ssd
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Llama 70B Async K=6 f=3 B=1 temp=0.7 ==='
 python -O bench/bench.py --size 70 --draft 1 --gpus 5 --spec --async --k 6 --f 3 --b 1 --backup jit --numseqs 8 --output_len 512 --temp 0.7
@@ -133,7 +133,7 @@ cd /home/tkumar/ssd
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
 export PYTHONPATH=/home/tkumar/ssd
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 
 BENCH="python -O bench/bench.py"
@@ -179,7 +179,7 @@ cd /home/tkumar/ssd
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOBID
 export PYTHONPATH=/home/tkumar/ssd
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 echo "Node: $(hostname), Job: $SLURM_JOBID"
 echo '=== Qwen 32B AR temp=0 ==='
 python -O bench/bench.py --qwen --size 32 --gpus 4 --b 1 --numseqs 8 --output_len 512 --temp 0

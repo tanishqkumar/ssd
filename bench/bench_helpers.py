@@ -5,7 +5,7 @@ import json
 from random import randint
 from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
-from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B
+from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
 
 
 def _get_snapshot_path(base_path: str) -> str:
@@ -47,19 +47,15 @@ def _get_draft_model_path(args, cache_dir: str) -> str:
     # Handle EAGLE auto-selection
     if getattr(args, "eagle", False):
         if args.llama:
-            # Map target model size to corresponding EAGLE draft
             if args.size == "8":
-                return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.1-Instruct-8B")
+                return EAGLE3_YUHUILI_8B
             elif args.size == "70":
-                if os.path.isdir(EAGLE3_SPECFORGE_70B):
-                    return EAGLE3_SPECFORGE_70B
-                return os.path.join(cache_dir, "models--yuhuili--EAGLE3-LLaMA3.3-Instruct-70B")
+                return EAGLE3_SPECFORGE_70B
             else:
                 raise ValueError(f"EAGLE draft not available for Llama size {args.size}")
         else:
-            # Qwen
             if args.size == "32":
-                return os.path.join(cache_dir, "models--RedHatAI--Qwen3-32B-speculator.eagle3")
+                return EAGLE3_QWEN_32B
             else:
                 raise ValueError(f"EAGLE draft not available for Qwen size {args.size}")
 

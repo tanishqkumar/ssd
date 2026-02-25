@@ -572,7 +572,7 @@ def plot_acceptance_rates(results_by_pair: dict, temps: list, draft_sizes: list,
     fig.patch.set_facecolor('white')
     plt.tight_layout(pad=4.0)
 
-    plot_dir = '/home/tkumar/async-spec/scripts/plots/alpha'
+    plot_dir = '/home/tkumar/ssd/scripts/plots/alpha'
     os.makedirs(plot_dir, exist_ok=True)
     temp_strs = [f'T0' if t == 0.0 else f'T{t}' for t in temps_sorted]
     draft_strs = [f'{d}B' for d in drafts_sorted]
@@ -671,7 +671,11 @@ def plot_results(all_results_sweep1, all_results_sweep2, target_size, f_values, 
     fig.patch.set_facecolor('white')
     plt.tight_layout(pad=4.0)
 
+<<<<<<< HEAD
     plot_dir = '/home/tkumar/async-spec/scripts/plots/camera'
+=======
+    plot_dir = '/home/tkumar/ssd/scripts/plots/camera'
+>>>>>>> main
     os.makedirs(plot_dir, exist_ok=True)
 
     temp_strs = set()

@@ -84,7 +84,7 @@ def main():
     # Initialize wandb if requested
     if args.wandb:
         wandb.init(
-            project="async-spec",
+            project="ssd",
             name=run_name,
             group=args.group,
             config={

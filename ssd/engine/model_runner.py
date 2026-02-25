@@ -140,18 +140,18 @@ class ModelRunner:
             elif self.rank == 0: # target in a distributed setup 
                 # Try to clean up any existing shared memory first
                 try:
-                    existing_shm = SharedMemory(name="nanovllm")
+                    existing_shm = SharedMemory(name="ssd")
                     existing_shm.close() # here we bind it 
                     existing_shm.unlink()
                 except FileNotFoundError:
                     # can proceed, nothing to clean up 
                     pass
                 
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**28)
+                self.shm = SharedMemory(name="ssd", create=True, size=2**28)
                 dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # leader on tp_group 
             else: 
                 dist.barrier(group=self.tp_pg, device_ids=[self.rank]) # follower on tp_group, don't want them hooking onto shm before its been created 
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name="ssd")
                 self.loop()
                 
         if self.verbose: print(f'-----{model_type}MODEL RUNNER INITIALIZED----', flush=True)

@@ -6,7 +6,7 @@ OUTDIR="${1:?Usage: bash tests/collect_results.sh <suite_dir>}"
 SUMMARY="${OUTDIR}/RESULTS.md"
 
 source /home/tkumar/miniconda3/etc/profile.d/conda.sh
-conda activate async-spec
+conda activate ssd
 
 cat > "$SUMMARY" << 'HEADER'
 # SSD Test Suite Results
