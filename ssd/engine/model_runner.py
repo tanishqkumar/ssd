@@ -495,7 +495,10 @@ class ModelRunner:
             usable_bytes = max(usable_bytes - reserved_bytes, 0)
             assert usable_bytes > 0, "ERROR: Not enough memory for draft KV cache after accounting for tree_cache for logits storage"
 
-        config.num_kvcache_blocks = int(usable_bytes) // block_bytes
+        if config.num_kvcache_blocks is not None:
+            config.num_kvcache_blocks = min(config.num_kvcache_blocks, int(usable_bytes) // block_bytes)
+        else:
+            config.num_kvcache_blocks = int(usable_bytes) // block_bytes
         if self.verbose:
             print(f'KV CACHE ALLOCATION for {"TARGET" if not self.is_draft else "DRAFT"} model', flush=True)
             print(f' free={free/1e9:.2f}GB, util={config.gpu_memory_utilization:.2f}', flush=True)

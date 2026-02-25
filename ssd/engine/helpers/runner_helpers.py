@@ -7,95 +7,43 @@ from ssd.utils.async_helpers.nccl_pack import send_int64, recv_int64
 
 
 def send_speculation_request(
-    seqs: list[Sequence],
-    lookahead: int,
-    async_fan_out: int,
-    max_blocks: int,
-    eagle: bool,
-    draft_dtype: torch.dtype,
-    device: torch.device,
+    cmd: torch.Tensor,
+    meta: torch.Tensor,
+    cache_keys: torch.Tensor,
+    num_tokens: torch.Tensor,
+    block_tables: torch.Tensor,
+    temps: torch.Tensor,
     async_pg: dist.ProcessGroup,
     draft_runner_rank: int,
 ):
-    """Send the complete request: cmd, metadata, and payload."""
-
-    # Validate critical sequence state that's not obvious from type hints
-    assert len(seqs) > 0, "seqs must be non-empty"
-    for i, seq in enumerate(seqs):
-        assert seq.recovery_token_id is not None, f"seq[{i}].recovery_token_id cannot be None - required for cache key generation"
-        assert len(seq.draft_block_table) <= max_blocks, f"seq[{i}].draft_block_table length ({len(seq.draft_block_table)}) exceeds max_blocks ({max_blocks})"
-
-    # Send spec request command
-    cmd, meta, cache_keys, num_tokens, temperatures, draft_block_tables, recovery_activations = prepare_speculation_request_payload(
-        seqs,
-        len(seqs),
-        lookahead,
-        async_fan_out,
-        device,
-        max_blocks,
-        eagle,
-    )
-
-    # Send spec request command (0 for spec)
     dist.send(cmd, dst=draft_runner_rank, group=async_pg)
-
-    # Send metadata (B, K, F)
     dist.send(meta, dst=draft_runner_rank, group=async_pg)
-
-    # Send payload data
-    assert num_tokens.shape == (len(seqs),)
     send_int64(
         async_pg,
         draft_runner_rank,
         cache_keys,
         num_tokens,
-        draft_block_tables,
+        block_tables.to(torch.int64),
+        temps,
     )
-    # These are float tensors, so we need to send them separately
-    dist.send(temperatures, dst=draft_runner_rank, group=async_pg)
-    if recovery_activations is not None:
-        # Cast to draft dtype to match draft receive buffer
-        dist.send(recovery_activations.to(draft_dtype), dst=draft_runner_rank, group=async_pg)
 
 
 def receive_speculation_response(
-    batch_size: int,
-    lookahead: int,
-    vocab_size: int,
-    draft_dtype: torch.dtype,
-    device: torch.device,
+    B,
+    K, # Lookahead
+    fused_response: torch.Tensor,
+    logits_q: torch.Tensor,
     async_pg: dist.ProcessGroup,
     draft_runner_rank: int,
+    skip_logits: bool = False,
 ):
-    """Receive the response: cache hits, speculations, and logits.
-
-    Returns:
-        speculations: [B, K] tensor of speculated tokens
-        logits_q: [B, K, V] tensor of draft model logits
-        cache_hits: [B] tensor of cache hit indicators
-    """
-    # Contract: recv_int64 expects exactly B + B*K elements for fused response
-    B, K, V = batch_size, lookahead, vocab_size
-    expected_fused_size = B + B * K
-    fused_response = recv_int64(async_pg, draft_runner_rank, expected_fused_size, device)
-
-    # Split fused response according to protocol contract
-    cache_hits = fused_response[:B]  # [B]
-    spec_tokens_flat = fused_response[B:]  # [B*K]
-
-    # Reshape spec tokens according to protocol contract: flat [B*K] -> [B, K]
-    speculations = spec_tokens_flat.view(B, K)
-
-    # Draft now returns full target vocab size logits (after d2t expansion)
-    logits_q = torch.empty(B, K, V, dtype=draft_dtype, device=device)
-    dist.recv(logits_q, src=draft_runner_rank, group=async_pg)
-
-    # Post-condition shape validation
-    assert speculations.shape == (B, K), f"speculations shape mismatch: expected ({B}, {K}), got {speculations.shape}"
-    assert logits_q.shape == (B, K, V), f"logits_q shape mismatch: expected ({B}, {K}, {V}), got {logits_q.shape}"
-
+    # Receive response into pre-allocated buffers
+    dist.recv(fused_response, src=draft_runner_rank, group=async_pg)
+    cache_hits = fused_response[:B]
+    speculations = fused_response[B:].view(B, K)
+    if not skip_logits:
+        dist.recv(logits_q, src=draft_runner_rank, group=async_pg)
     return speculations, logits_q, cache_hits
-
 
 def prepare_prefill_metadata(
     total_new_tokens: int,
