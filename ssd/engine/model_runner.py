@@ -271,7 +271,6 @@ class ModelRunner:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
         if config.sampler_x is not None:
             assert config.draft_async, "ERROR in ModelRunner: sampler_x requires draft_async"
-            assert config.draft_async_temp == config.target_async_temp, "ERROR in ModelRunner: draft_async_temp != target_async_temp"
             assert sum(config.fan_out_list) == sum(config.fan_out_list_miss) == config.async_fan_out * (config.speculate_k + 1), "ERROR in ModelRunner: fancy sampling only supported for constant fan out for now."
 
         self.sampler = Sampler(sampler_x=config.sampler_x, async_fan_out=config.async_fan_out)

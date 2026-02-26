@@ -227,7 +227,7 @@ def prepare_speculation_request_payload(seqs, B, K, F, device, max_blocks, eagle
 
     # Draft-side temperatures for tree decode: prefer per-seq override, else global config override, else seq.temperature
     temperatures = torch.tensor(
-        [seq.draft_temperature or seq.temperature for seq in seqs],
+        [seq.draft_temperature if seq.draft_temperature is not None else seq.temperature for seq in seqs],
         dtype=torch.float32,
         device=device,
     )  # [B]

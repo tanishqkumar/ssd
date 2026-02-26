@@ -146,7 +146,7 @@ class SpeculatorAsync(SpeculatorBase):
             self._cache_keys[i, 1] = seq.last_spec_step_accepted_len - 1
             self._cache_keys[i, 2] = seq.recovery_token_id
             self._num_tokens_buf[i] = seq.num_tokens
-            self._temps_buf[i] = seq.draft_temperature or seq.temperature
+            self._temps_buf[i] = seq.draft_temperature if seq.draft_temperature is not None else seq.temperature
             bt = seq.draft_block_table
             bt_len = len(bt)
             if bt_len > 0:
