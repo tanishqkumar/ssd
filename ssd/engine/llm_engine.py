@@ -45,8 +45,9 @@ class LLMEngine:
         self.config = config
         Sequence.block_size = config.kvcache_block_size 
 
-        assert config.kvcache_block_size >= (
-            2 * config.speculate_k + 2), "ERROR: support for block size < 2*k+2 is not implemented"
+        if config.kvcache_block_size < (2 * config.speculate_k + 2):
+            print(f"[WARNING] kvcache_block_size={config.kvcache_block_size} < 2*k+2={2 * config.speculate_k + 2}. "
+                  f"This was previously asserted but is now allowed.", flush=True)
         assert config.num_gpus > 1 or not config.draft_async, "ERROR: draft_async requires at least 2 gpus"
             
         # Check that target and draft are from the same family

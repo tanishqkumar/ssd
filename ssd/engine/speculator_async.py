@@ -54,7 +54,7 @@ class SpeculatorAsync(SpeculatorBase):
         self._hs_B = B
         d = self.device
         self._cmd = torch.zeros(1, dtype=torch.int64, device=d)
-        self._meta = torch.tensor([B, self.K, self.async_fan_out], dtype=torch.int64, device=d)
+        self._meta = torch.tensor([B, self.K, self.async_fan_out, self.max_blocks], dtype=torch.int64, device=d)
         self._cache_keys = torch.empty(B, 3, dtype=torch.int64, device=d)
         self._num_tokens_buf = torch.empty(B, dtype=torch.int64, device=d)
         self._temps_buf = torch.empty(B, dtype=torch.float32, device=d)

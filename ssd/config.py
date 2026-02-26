@@ -15,7 +15,7 @@ class Config:
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
-    kvcache_block_size: int = 256
+    kvcache_block_size: int = 1
     num_kvcache_blocks: int = -1
     device: torch.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -25,7 +25,7 @@ class Config:
     draft: str = DEFAULT_DRAFT
     speculate_k: int = 1
     draft_async: bool = False
-    
+
     # async spec only
     async_fan_out: int = 3
     fan_out_list: list[int] | None = None

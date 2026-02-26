@@ -311,11 +311,10 @@ class DraftRunner(ModelRunner):
 
     def _service_spec_request(self):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
-        meta = self.recv_tensor((3,), torch.int64)
-        B, K, F = meta.tolist()
+        meta = self.recv_tensor((4,), torch.int64)
+        B, K, F, max_blocks = meta.tolist()
 
         # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
-        max_blocks = self.config.max_blocks
         fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
         fused_req = recv_int64(self.async_pg, src=0,
                                total_length=fused_total, device=self.device)
