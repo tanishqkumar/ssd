@@ -25,7 +25,7 @@ DEFAULT_DRAFT = os.environ.get(
 # eagle3 draft model paths. override via env vars if your models live elsewhere.
 EAGLE3_SPECFORGE_70B = os.environ.get(
     "SSD_EAGLE3_SPECFORGE_70B",
-    "/data/tkumar/huggingface/hub/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
+    f"{HF_CACHE_DIR}/models--lmsys--SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
 )
 EAGLE3_YUHUILI_8B = os.environ.get(
     "SSD_EAGLE3_8B",

@@ -1,99 +1,168 @@
+from datetime import datetime
+import os
 import torch
 import torch.distributed as dist
 
 from ssd.engine.sequence import Sequence
 from ssd.utils.async_helpers.nccl_pack import send_int64, recv_int64
 
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+_nccl_tokenizer = None
+
+
+def _ts():
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+
+def _get_nccl_tokenizer():
+    global _nccl_tokenizer
+    if _nccl_tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+            _nccl_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        except Exception as e:
+            print(f"[{_ts()}] [NCCL_LOG] Failed to load tokenizer: {e}", flush=True)
+            return None
+    return _nccl_tokenizer
+
+
+def _decode_ids(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return "<no tokenizer>"
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return tok.decode(ids)
+
+
+def _decode_id_list(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return []
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return [tok.decode([t]) for t in ids]
+
 
 def send_speculation_request(
-    seqs: list[Sequence],
-    lookahead: int,
-    async_fan_out: int,
-    max_blocks: int,
-    eagle: bool,
-    draft_dtype: torch.dtype,
-    device: torch.device,
+    cmd: torch.Tensor,
+    meta: torch.Tensor,
+    cache_keys: torch.Tensor,
+    num_tokens: torch.Tensor,
+    block_tables: torch.Tensor,
+    temps: torch.Tensor,
     async_pg: dist.ProcessGroup,
     draft_runner_rank: int,
 ):
-    """Send the complete request: cmd, metadata, and payload."""
-
-    # Validate critical sequence state that's not obvious from type hints
-    assert len(seqs) > 0, "seqs must be non-empty"
-    for i, seq in enumerate(seqs):
-        assert seq.recovery_token_id is not None, f"seq[{i}].recovery_token_id cannot be None - required for cache key generation"
-        assert len(seq.draft_block_table) <= max_blocks, f"seq[{i}].draft_block_table length ({len(seq.draft_block_table)}) exceeds max_blocks ({max_blocks})"
-
-    # Send spec request command
-    cmd, meta, cache_keys, num_tokens, temperatures, draft_block_tables, recovery_activations = prepare_speculation_request_payload(
-        seqs,
-        len(seqs),
-        lookahead,
-        async_fan_out,
-        device,
-        max_blocks,
-        eagle,
-    )
-
-    # Send spec request command (0 for spec)
+    if NCCL_LOG:
+        B = meta[0].item()
+        K = meta[1].item()
+        F = meta[2].item()
+        sep = '=' * 80
+        print(f"[{_ts()}] \n{sep}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_SPEC] cmd={cmd.tolist()}, meta=[B={B}, K={K}, F={F}]", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_SPEC] cache_keys shape={cache_keys.shape}", flush=True)
+        for i in range(B):
+            seq_id, accept_len, verified_id = cache_keys[i].tolist()
+            verified_text = _decode_ids(cache_keys[i, 2])
+            print(f"[{_ts()}]   req[{i}]: seq_id={seq_id}, accept_len={accept_len}, verified_id={verified_id} ('{verified_text}')", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_SPEC] num_tokens={num_tokens.tolist()}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_SPEC] block_tables shape={block_tables.shape}, values={block_tables.tolist()}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_SPEC] temps={temps.tolist()}", flush=True)
+        print(f"[{_ts()}] {sep}\n", flush=True)
     dist.send(cmd, dst=draft_runner_rank, group=async_pg)
-
-    # Send metadata (B, K, F)
     dist.send(meta, dst=draft_runner_rank, group=async_pg)
-
-    # Send payload data
-    assert num_tokens.shape == (len(seqs),)
     send_int64(
         async_pg,
         draft_runner_rank,
         cache_keys,
         num_tokens,
-        draft_block_tables,
+        block_tables.to(torch.int64),
+        temps,
     )
-    # These are float tensors, so we need to send them separately
-    dist.send(temperatures, dst=draft_runner_rank, group=async_pg)
-    if recovery_activations is not None:
-        # Cast to draft dtype to match draft receive buffer
-        dist.send(recovery_activations.to(draft_dtype), dst=draft_runner_rank, group=async_pg)
 
 
 def receive_speculation_response(
-    batch_size: int,
-    lookahead: int,
-    vocab_size: int,
-    draft_dtype: torch.dtype,
-    device: torch.device,
+    B,
+    K, # Lookahead
+    fused_response: torch.Tensor,
+    logits_q: torch.Tensor,
     async_pg: dist.ProcessGroup,
     draft_runner_rank: int,
+    skip_logits: bool = False,
 ):
-    """Receive the response: cache hits, speculations, and logits.
-
-    Returns:
-        speculations: [B, K] tensor of speculated tokens
-        logits_q: [B, K, V] tensor of draft model logits
-        cache_hits: [B] tensor of cache hit indicators
-    """
-    # Contract: recv_int64 expects exactly B + B*K elements for fused response
-    B, K, V = batch_size, lookahead, vocab_size
-    expected_fused_size = B + B * K
-    fused_response = recv_int64(async_pg, draft_runner_rank, expected_fused_size, device)
-
-    # Split fused response according to protocol contract
-    cache_hits = fused_response[:B]  # [B]
-    spec_tokens_flat = fused_response[B:]  # [B*K]
-
-    # Reshape spec tokens according to protocol contract: flat [B*K] -> [B, K]
-    speculations = spec_tokens_flat.view(B, K)
-
-    # Draft now returns full target vocab size logits (after d2t expansion)
-    logits_q = torch.empty(B, K, V, dtype=draft_dtype, device=device)
-    dist.recv(logits_q, src=draft_runner_rank, group=async_pg)
-
-    # Post-condition shape validation
-    assert speculations.shape == (B, K), f"speculations shape mismatch: expected ({B}, {K}), got {speculations.shape}"
-    assert logits_q.shape == (B, K, V), f"logits_q shape mismatch: expected ({B}, {K}, {V}), got {logits_q.shape}"
-
+    # Receive response into pre-allocated buffers
+    dist.recv(fused_response, src=draft_runner_rank, group=async_pg)
+    cache_hits = fused_response[:B]
+    speculations = fused_response[B:].view(B, K)
+    if not skip_logits:
+        dist.recv(logits_q, src=draft_runner_rank, group=async_pg)
+    if NCCL_LOG:
+        sep = '=' * 80
+        print(f"[{_ts()}] \n{sep}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG RECV_SPEC_RESP] B={B}, K={K}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG RECV_SPEC_RESP] cache_hits={cache_hits.tolist()}", flush=True)
+        for i in range(B):
+            spec_ids = speculations[i].tolist()
+            spec_text = _decode_id_list(speculations[i])
+            print(f"[{_ts()}]   req[{i}]: speculations={spec_ids}", flush=True)
+            print(f"[{_ts()}]            decoded={spec_text}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG RECV_SPEC_RESP] skip_logits={skip_logits}", flush=True)
+        print(f"[{_ts()}] {sep}\n", flush=True)
     return speculations, logits_q, cache_hits
+
+def prepare_prefill_metadata(
+    total_new_tokens: int,
+    batch_size: int,
+    max_blocks: int,
+    eagle: bool,
+    eagle_act_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    metadata = torch.tensor([
+        total_new_tokens,
+        batch_size,
+        max_blocks,
+        1 if eagle else 0,
+        eagle_act_dim if eagle else 0,
+    ], dtype=torch.int64, device=device)
+    return metadata
+
+
+def send_prefill_request(
+    cmd: torch.Tensor,
+    metadata: torch.Tensor,
+    input_ids: torch.Tensor,
+    num_tokens: torch.Tensor,
+    draft_block_table: torch.Tensor,
+    eagle_acts: torch.Tensor,
+    draft_process_group: dist.ProcessGroup,
+    draft_runner_rank: int,
+):
+    if NCCL_LOG:
+        sep = '=' * 80
+        print(f"[{_ts()}] \n{sep}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] cmd={cmd.tolist()}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] metadata={metadata.tolist()}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] input_ids shape={input_ids.shape}, values={input_ids.tolist()}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] input_ids decoded='{_decode_ids(input_ids)}'", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] num_tokens={num_tokens.tolist()}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+        print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
+        print(f"[{_ts()}] {sep}\n", flush=True)
+    dist.send(cmd, dst=draft_runner_rank, group=draft_process_group)
+    dist.send(metadata, dst=draft_runner_rank, group=draft_process_group)
+    send_int64(
+        draft_process_group,
+        draft_runner_rank,
+        input_ids,
+        num_tokens,
+        draft_block_table.to(torch.int64),
+    )
+    if eagle_acts is not None:
+        dist.send(eagle_acts, dst=draft_runner_rank, group=draft_process_group)
 
 
 def prepare_prefill_payload(
@@ -125,13 +194,14 @@ def prepare_prefill_payload(
     cmd = torch.tensor([1], dtype=torch.int64, device=device)
 
     # 4) send metadata for tensor reconstruction
-    metadata = torch.tensor([
+    metadata = prepare_prefill_metadata(
         input_ids_flat.size(0),
-        len(input_id_list),  # batch_size
+        num_tokens.shape[0],
         max_blocks,
-        1 if eagle_acts is not None else 0,
+        eagle_acts is not None,
         eagle_acts.shape[1] if eagle_acts is not None else 0,
-    ], dtype=torch.int64, device=device)
+        device,
+    )
 
     if eagle_acts is not None:
         assert eagle_acts.shape[0] == input_ids_flat.shape[0], (
@@ -324,5 +394,3 @@ def prepare_prefill_tensors_from_seqs(
         slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
     
     return input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping
-
-

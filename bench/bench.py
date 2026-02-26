@@ -179,6 +179,11 @@ def create_llm_kwargs(args, draft_path):
     if args.flm is not None:
         llm_kwargs["fan_out_list_miss"] = args.flm
 
+    if args.eagle:
+        llm_kwargs['use_eagle'] = True
+    if args.debug:
+        llm_kwargs['debug_mode'] = True
+
     return llm_kwargs
 
 
@@ -295,10 +300,6 @@ def main():
     
     # Create LLM
     llm_kwargs = create_llm_kwargs(args, draft_path)
-    if args.eagle:
-        llm_kwargs['use_eagle'] = True
-    if args.debug:
-        llm_kwargs['debug_mode'] = True
         
     llm = LLM(model_path, **llm_kwargs)
     

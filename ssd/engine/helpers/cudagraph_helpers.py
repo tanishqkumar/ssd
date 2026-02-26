@@ -1,9 +1,9 @@
 import os
+import math
 import torch
 import numpy as np
-from typing import List
+
 from ssd.utils.context import set_context, get_context, reset_context
-from ssd.engine.helpers.mask_helpers import get_custom_mask
 from time import perf_counter
 
 
@@ -78,7 +78,7 @@ def run_verify_cudagraph(model_runner, input_ids, positions, last_only, graph_va
         torch.cuda.synchronize()
         _t2 = perf_counter()
         has_eagle = "eagle_acts" in graph_vars
-        print(f"[PROFILE verify_cg] replay={(_t1-_t0)*1000:.2f}ms logits={(_t2-_t1)*1000:.2f}ms eagle={has_eagle} bs={orig_bs} rank={model_runner.rank}", flush=True)
+        print(f"[cuda_graph_helpers.run_verify_cudagraph][PROFILE verify_cg] replay={(_t1-_t0)*1000:.2f}ms logits={(_t2-_t1)*1000:.2f}ms eagle={has_eagle} bs={orig_bs} rank={model_runner.rank}", flush=True)
 
     # For eagle target, also return eagle_acts
     if "eagle_acts" in graph_vars:
@@ -144,7 +144,7 @@ def flush_draft_profile():
         detail = " ".join(f"{l}={t:.2f}" for l, t in by_step[step])
         parts.append(f"s{step}={step_total:.2f}({detail})")
         total += step_total
-    print(f"[PROFILE draft_detail] K={len(by_step)} total={total:.2f}ms avg_step={total/len(by_step):.2f}ms | {' '.join(parts)}", flush=True)
+    print(f"[cuda_graph_helpers.flush_draft_profile][PROFILE draft_detail] K={len(by_step)} total={total:.2f}ms avg_step={total/len(by_step):.2f}ms | {' '.join(parts)}", flush=True)
     _draft_events.clear()
 
 @torch.inference_mode()
@@ -373,7 +373,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         False, -1,
     ]
     if wrapper._backend == "fa2":
-        plan_args.extend([-1, False])
+        plan_args.extend([-1, False, 0])  # fixed_split_size, disable_split_kv, num_colocated_ctas
     wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
 
     if PROFILE_DRAFT:
@@ -425,7 +425,7 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
     logits_all = graph_vars["logits"][:flat_batch_size]
 
     if PROFILE:
-        print(f"[run_fi_tree_decode_cudagraph] step {step}: precompute={precompute_time:.3f}ms, plan={plan_time:.3f}ms, buffer={buffer_prep_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
+        print(f"[cuda_graph_helpers.run_fi_tree_decode_cudagraph] step {step}: precompute={precompute_time:.3f}ms, plan={plan_time:.3f}ms, buffer={buffer_prep_time:.3f}ms, replay={replay_time:.3f}ms", flush=True)
 
     logits_out = logits_all[:orig_flat]
     # EAGLE draft: also return prenorm (outputs) for self-conditioning
@@ -491,7 +491,10 @@ def capture_cudagraph(model_runner):
         hidden_states = torch.zeros(max_bs, hf_config.hidden_size,
                                     dtype=hf_config.torch_dtype, device=input_ids.device)
 
-    for bs in reversed(graph_bs_list):
+    total_graphs = len(graph_bs_list)
+    print(f'[capture_cudagraph] Starting capture of {total_graphs} graphs, bs list: {graph_bs_list[:5]}...{graph_bs_list[-3:]} max_bs={max_bs}', flush=True)
+    for idx, bs in enumerate(reversed(graph_bs_list)):
+        print(f'[capture_cudagraph] Capturing graph {idx+1}/{total_graphs}, bs={bs}', flush=True)
         graph = torch.cuda.CUDAGraph()
         set_context(
             False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], is_jit=is_jit)
@@ -721,7 +724,7 @@ def capture_glue_decode_cudagraph(model_runner):
     graphs = {}
     graph_pool = None
 
-    print(f'[capture_glue_decode_cudagraph] Capturing for bs={graph_bs_list}', flush=True)
+    print(f'[cuda_graph_helpers.capture_glue_decode_cudagraph] Capturing for bs={graph_bs_list}', flush=True)
 
     for bs in reversed(graph_bs_list):
         graph = torch.cuda.CUDAGraph()
@@ -814,7 +817,7 @@ def capture_fi_tree_decode_cudagraph(model_runner):
         fi_hidden_states = torch.zeros(max_flat_batch_size, hf_config.hidden_size,
                                        dtype=hf_config.torch_dtype, device=model_runner.device)
 
-    print(f'About to capture FI cudagraphs for bs={graph_bs_list}', flush=True)
+    print(f'[cuda_graph_helpers.capture_fi_tree_decode_cudagraph] About to capture FI cudagraphs for bs={graph_bs_list}', flush=True)
 
     for bs in reversed(graph_bs_list):
         graph = torch.cuda.CUDAGraph()

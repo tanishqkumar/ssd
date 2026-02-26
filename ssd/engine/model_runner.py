@@ -30,8 +30,8 @@ from ssd.engine.helpers.cudagraph_helpers import (
     capture_verify_cudagraph,
     capture_fi_tree_decode_cudagraph,
     capture_glue_decode_cudagraph,
-    get_custom_mask,
 )
+from ssd.engine.helpers.mask_helpers import get_custom_mask
     
 
 class ModelRunner:
@@ -59,7 +59,7 @@ class ModelRunner:
         
         # TODO: Get rid of this.
         if self.is_draft:
-            should_use_dist = self.config.draft_async
+            should_use_dist = self.config.draft_async and self.config.async_nccl_port is None
         else:
             should_use_dist = self.config.num_gpus > 1
 
@@ -256,7 +256,17 @@ class ModelRunner:
         load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
         
         if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
-            self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
+            if config.async_nccl_port is not None:
+                from torch.distributed import TCPStore
+                from ssd.utils.dist_utils import init_custom_process_group
+                store = TCPStore("127.0.0.1", port=config.async_nccl_port,
+                                 world_size=2, is_master=False)
+                with torch.cuda.device(self.device):
+                    self.async_pg = init_custom_process_group(
+                        backend="nccl", store=store, world_size=2, rank=1,
+                        group_name="async_spec")
+            else:
+                self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
         if self.verbose:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
         if config.sampler_x is not None:
@@ -270,10 +280,6 @@ class ModelRunner:
         if self.verbose:
             print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
         self.allocate_kv_cache()
-        if init_q is not None:
-            # super().__init__() runs warmup and calculates num_kvcache_blocks, pass that up
-            init_q.put(self.config.num_kvcache_blocks)
-            init_q.close()
 
         if not self.enforce_eager:
             # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate): 
@@ -300,6 +306,14 @@ class ModelRunner:
                 self.graph_pools["glue_decode"] = glue_pool
                 self.graphs["glue_decode"] = glue_graphs
                 self.graph_bs_list["glue_decode"] = glue_bs_list
+
+        if init_q is not None:
+            # Signal the scheduler that we're fully initialized (model loaded,
+            # KV cache allocated, CUDA graphs captured).  Must happen after
+            # CUDA graph capture so the scheduler doesn't send NCCL requests
+            # before the draft runner enters its recv loop.
+            init_q.put(self.config.num_kvcache_blocks)
+            init_q.close()
 
         return model_type
 
@@ -356,7 +370,7 @@ class ModelRunner:
                 pass
             try:
                 # Default group
-                if self.world_size > 1 or (self.draft_async and self.is_draft):
+                if (self.world_size > 1 or (self.draft_async and self.is_draft)) and self.config.async_nccl_port is None:
                     dist.destroy_process_group()
             except Exception:
                 pass
@@ -484,7 +498,10 @@ class ModelRunner:
             usable_bytes = max(usable_bytes - reserved_bytes, 0)
             assert usable_bytes > 0, "ERROR: Not enough memory for draft KV cache after accounting for tree_cache for logits storage"
 
-        config.num_kvcache_blocks = int(usable_bytes) // block_bytes
+        if config.num_kvcache_blocks is not None and config.num_kvcache_blocks > 0:
+            config.num_kvcache_blocks = min(config.num_kvcache_blocks, int(usable_bytes) // block_bytes)
+        else:
+            config.num_kvcache_blocks = int(usable_bytes) // block_bytes
         if self.verbose:
             print(f'KV CACHE ALLOCATION for {"TARGET" if not self.is_draft else "DRAFT"} model', flush=True)
             print(f' free={free/1e9:.2f}GB, util={config.gpu_memory_utilization:.2f}', flush=True)
@@ -501,7 +518,7 @@ class ModelRunner:
             num_kv_heads,
             hf_config.head_dim, 
         )
-        
+
         print(f"allocate_kv_cache(): kv_cache shape = {self.kv_cache.shape}", flush=True)
         layer_id = 0
         for module in self.model.modules():

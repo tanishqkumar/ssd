@@ -73,13 +73,14 @@ class SpecDecodeStep(InferenceStep):
 
     def prefill(self, seqs: list[Sequence]) -> int:
         # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
-        if not self.eagle and self.async_spec:
-            empty_verify_result = VerifyResult([], [], None)
-            self.speculator.prefill(seqs, empty_verify_result)
-            verify_result = self.verifier.prefill(seqs, eagle=False)
-        else:
-            verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
-            self.speculator.prefill(seqs, verify_result)
+        # TEMPORARY: Disable prefill optimization of running draft and target prefills in parallel.
+        # if not self.eagle and self.async_spec:
+        #     empty_verify_result = VerifyResult([], [], None)
+        #     self.speculator.prefill(seqs, empty_verify_result)
+        #     verify_result = self.verifier.prefill(seqs, eagle=False)
+        # else:
+        verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
+        self.speculator.prefill(seqs, verify_result)
 
         for seq in seqs:
             assert seq.recovery_token_id is not None
