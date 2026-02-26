@@ -1,8 +1,8 @@
-import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 import torch
 from ssd.paths import DEFAULT_TARGET, DEFAULT_DRAFT
+
 
 @dataclass
 class Config:
@@ -51,8 +51,7 @@ class Config:
         return (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
 
     def __post_init__(self):
-        model = self.model 
-        # assert os.path.isdir(model)
+        model = self.model
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
         self.hf_config = AutoConfig.from_pretrained(model)

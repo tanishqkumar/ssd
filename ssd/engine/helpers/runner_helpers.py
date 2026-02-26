@@ -1,6 +1,5 @@
-from typing import Any
-import os
 from datetime import datetime
+import os
 import torch
 import torch.distributed as dist
 
@@ -10,8 +9,10 @@ from ssd.utils.async_helpers.nccl_pack import send_int64, recv_int64
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 _nccl_tokenizer = None
 
+
 def _ts():
     return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
 
 def _get_nccl_tokenizer():
     global _nccl_tokenizer
@@ -24,6 +25,7 @@ def _get_nccl_tokenizer():
             return None
     return _nccl_tokenizer
 
+
 def _decode_ids(ids_tensor):
     tok = _get_nccl_tokenizer()
     if tok is None:
@@ -32,6 +34,7 @@ def _decode_ids(ids_tensor):
     if isinstance(ids, int):
         ids = [ids]
     return tok.decode(ids)
+
 
 def _decode_id_list(ids_tensor):
     tok = _get_nccl_tokenizer()
@@ -149,6 +152,47 @@ def send_prefill_request(
         print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
         print(f"[{_ts()}] [NCCL_LOG SEND_PREFILL] eagle_acts={'None' if eagle_acts is None else f'shape={eagle_acts.shape}'}", flush=True)
         print(f"[{_ts()}] {sep}\n", flush=True)
+    dist.send(cmd, dst=draft_runner_rank, group=draft_process_group)
+    dist.send(metadata, dst=draft_runner_rank, group=draft_process_group)
+    send_int64(
+        draft_process_group,
+        draft_runner_rank,
+        input_ids,
+        num_tokens,
+        draft_block_table.to(torch.int64),
+    )
+    if eagle_acts is not None:
+        dist.send(eagle_acts, dst=draft_runner_rank, group=draft_process_group)
+
+
+def prepare_prefill_metadata(
+    total_new_tokens: int,
+    batch_size: int,
+    max_blocks: int,
+    eagle: bool,
+    eagle_act_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    metadata = torch.tensor([
+        total_new_tokens,
+        batch_size,
+        max_blocks,
+        1 if eagle else 0,
+        eagle_act_dim if eagle else 0,
+    ], dtype=torch.int64, device=device)
+    return metadata
+
+
+def send_prefill_request(
+    cmd: torch.Tensor,
+    metadata: torch.Tensor,
+    input_ids: torch.Tensor,
+    num_tokens: torch.Tensor,
+    draft_block_table: torch.Tensor,
+    eagle_acts: torch.Tensor,
+    draft_process_group: dist.ProcessGroup,
+    draft_runner_rank: int,
+):
     dist.send(cmd, dst=draft_runner_rank, group=draft_process_group)
     dist.send(metadata, dst=draft_runner_rank, group=draft_process_group)
     send_int64(
