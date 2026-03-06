@@ -11,6 +11,7 @@ Usage:
 
 Set model paths via env vars (BENCH_LLAMA_70B, etc.) or edit bench_paths.py.
 """
+
 import os
 import sys
 import json
@@ -22,6 +23,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(__file__))
 from bench_paths import MODELS, resolve_snapshot
+from server_lifecycle import ensure_port_available
 
 
 def get_server_cmd(args):
@@ -33,13 +35,20 @@ def get_server_cmd(args):
         draft = resolve_snapshot(MODELS["qwen_0.6b"])
 
     cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", target,
-        "--tensor-parallel-size", str(args.tp),
-        "--gpu-memory-utilization", str(args.mem_frac),
-        "--max-num-seqs", "1",
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        target,
+        "--tensor-parallel-size",
+        str(args.tp),
+        "--gpu-memory-utilization",
+        str(args.mem_frac),
+        "--max-num-seqs",
+        "1",
         "--disable-log-requests",
-        "--port", str(args.port),
+        "--port",
+        str(args.port),
     ]
 
     if args.mode == "sd":
@@ -78,8 +87,12 @@ def main():
     parser = argparse.ArgumentParser(description="Launch vLLM server and benchmark it")
     parser.add_argument("--llama", action="store_true", default=True)
     parser.add_argument("--qwen", action="store_true")
-    parser.add_argument("--mode", choices=["ar", "sd"], default="sd",
-                        help="ar = autoregressive, sd = speculative decoding (default)")
+    parser.add_argument(
+        "--mode",
+        choices=["ar", "sd"],
+        default="sd",
+        help="ar = autoregressive, sd = speculative decoding (default)",
+    )
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--port", type=int, default=40020)
     parser.add_argument("--mem_frac", type=float, default=0.90)
@@ -99,27 +112,33 @@ def main():
     print(f"Mode: {args.mode}, Target: {target}")
     print(f"Server cmd: {' '.join(server_cmd)}")
 
-    # Kill stale vllm processes
-    subprocess.run(["pkill", "-9", "-f", "vllm.entrypoints"],
-                   capture_output=True)
-    time.sleep(2)
+    ensure_port_available(args.port, "vLLM")
 
     proc = subprocess.Popen(server_cmd, preexec_fn=os.setsid)
     try:
         print("Waiting for server...")
         if not wait_for_server(args.port):
-            print("Server failed to start"); sys.exit(1)
+            print("Server failed to start")
+            sys.exit(1)
         print("Server ready")
 
         bench_dir = os.path.dirname(__file__)
         eval_cmd = [
-            sys.executable, os.path.join(bench_dir, "vllm_eval_client.py"),
-            "--size", "70" if args.llama else "32",
-            "--numseqs", str(args.numseqs),
-            "--output_len", str(args.output_len),
-            "--temp", str(args.temp),
-            "--all", "--b", "1",
-            "--port", str(args.port),
+            sys.executable,
+            os.path.join(bench_dir, "vllm_eval_client.py"),
+            "--size",
+            "70" if args.llama else "32",
+            "--numseqs",
+            str(args.numseqs),
+            "--output_len",
+            str(args.output_len),
+            "--temp",
+            str(args.temp),
+            "--all",
+            "--b",
+            "1",
+            "--port",
+            str(args.port),
         ]
         if args.llama:
             eval_cmd.append("--llama")
