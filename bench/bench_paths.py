@@ -81,4 +81,9 @@ def resolve_snapshot(path: str) -> str:
             candidate = os.path.join(snapshots, d)
             if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "config.json")):
                 return candidate
-    return path
+    if os.path.isdir(path):
+        for d in os.listdir(path):
+            candidate = os.path.join(path, d)
+            if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "config.json")):
+                return candidate
+    raise FileNotFoundError(f"No snapshot (config.json) found under {path}")
