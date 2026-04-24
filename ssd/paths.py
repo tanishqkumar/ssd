@@ -1,4 +1,5 @@
 import os
+import torch
 
 # cuda arch for flashinfer kernel compilation. set this to match your gpu:
 # "9.0" for H100/H200, "8.0" for A100. AMD: "gfx942" for MI300x
