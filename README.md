@@ -87,8 +87,8 @@ cd ssd
 
 ```bash
 git clone --branch v0.5.3+amd.2 --depth 1 \
-    https://github.com/ROCm/flashinfer.git /home/yourname/tmp/flashinfer-build
-cd /home/yourname/tmp/flashinfer-build
+    https://github.com/ROCm/flashinfer.git /home/<your-username>/tmp/flashinfer-build
+cd /home/<your-username>/tmp/flashinfer-build
 docker build \
     --build-arg ROCM_VERSION=7.2 \
     --build-arg PY_VERSION=3.12 \
@@ -124,14 +124,14 @@ eval "$($MAMBA_EXE shell hook --shell bash)"
 micromamba activate flashinfer-py3.12-torch2.9.1-rocm7.2
 
 # Install FlashInfer from the source used to build the Docker
-pip install --no-build-isolation -ve /home/yourname/tmp/flashinfer-build
+pip install --no-build-isolation -ve /home/<your-username>/tmp/flashinfer-build
 
 #Verify the install:
 python -c "import torch; print(torch.__version__)"       # should print 2.9.1+...
 python -c "import flashinfer; print(flashinfer.__version__)"  # should print a version string
 
 # Install SSD and build flash-attn
-cd /home/yourname/ssd
+cd /home/<your-username>/ssd
 bash setup_rocm.sh
 ```
 
