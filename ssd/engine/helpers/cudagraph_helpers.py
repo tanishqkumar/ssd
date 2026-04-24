@@ -370,8 +370,13 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         model_runner.hf_config.num_key_value_heads,
         model_runner.block_size, wrapper.is_cuda_graph_enabled,
         model_runner.hf_config.head_dim, model_runner.hf_config.head_dim,
-        False,
     ]
+    if torch.version.hip is None:
+        plan_args.extend([False, -1])
+        if wrapper._backend == "fa2":
+            plan_args.extend([-1, False])
+    else:
+        plan_args.append(False)
     wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
 
     if PROFILE_DRAFT:

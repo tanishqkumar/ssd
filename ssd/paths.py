@@ -2,9 +2,9 @@ import os
 
 # cuda arch for flashinfer kernel compilation. set this to match your gpu:
 # "9.0" for H100/H200, "8.0" for A100. AMD: "gfx942" for MI300x
-CUDA_ARCH = os.environ.get("SSD_CUDA_ARCH", "gfx942")
+_DEFAULT_CUDA_ARCH = "gfx942" if torch.version.hip is not None else "9.0"
+CUDA_ARCH = os.environ.get("SSD_CUDA_ARCH", _DEFAULT_CUDA_ARCH)
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", CUDA_ARCH)
-
 
 def _required_env(var_name: str, note: str) -> str:
     value = os.environ.get(var_name)
