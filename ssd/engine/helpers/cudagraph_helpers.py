@@ -370,10 +370,8 @@ def run_fi_tree_decode_cudagraph(model_runner, input_ids, positions, last_only, 
         model_runner.hf_config.num_key_value_heads,
         model_runner.block_size, wrapper.is_cuda_graph_enabled,
         model_runner.hf_config.head_dim, model_runner.hf_config.head_dim,
-        False, -1,
+        False,
     ]
-    if wrapper._backend == "fa2":
-        plan_args.extend([-1, False])
     wrapper._plan_info = wrapper._cached_module.plan(*plan_args)
 
     if PROFILE_DRAFT:
@@ -854,12 +852,12 @@ def capture_fi_tree_decode_cudagraph(model_runner):
             kv_data_type=torch.bfloat16,
         )
 
-        # Set minimal context needed for run
         set_context(
             is_prefill=False,
             slot_mapping=slot_mapping[:bs * MQ_LEN],
             context_lens=context_lens[:bs],
-            block_tables=block_tables[:bs]
+            block_tables=block_tables[:bs],
+            prefill_wrapper=model_runner.prefill_wrappers[bs],
         )
 
         # Warmup run
