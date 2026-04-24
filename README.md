@@ -69,6 +69,56 @@ export HF_DATASETS_CACHE=/path/to  # parent of SSD_DATASET_DIR
 python scripts/get_data_from_hf.py --num-samples 10000
 ```
 
+## Setup (AMD MI300x / ROCm)
+
+Runs on AMD Instinct MI300x with ROCm 7.2, PyTorch 2.9.1, and
+[FlashInfer v0.5.3+amd.2](https://github.com/ROCm/flashinfer/releases/tag/v0.5.3%2Bamd.2)
+(ships [PR #214](https://github.com/ROCm/flashinfer/pull/214) kernel fixes).
+
+**1. Build the Docker image** (from the FlashInfer release source):
+
+```bash
+git clone --branch v0.5.3+amd.2 --depth 1 \
+    https://github.com/ROCm/flashinfer.git /tmp/flashinfer-build
+cd /tmp/flashinfer-build
+docker build \
+    --build-arg ROCM_VERSION=7.2 \
+    --build-arg PY_VERSION=3.12 \
+    --build-arg TORCH_VERSION=2.9.1 \
+    -t flashinfer-0.5.3.amd2_rocm7.2 \
+    -f .devcontainer/rocm/Dockerfile .
+```
+
+**2. Start and enter the container**:
+
+```bash
+docker run -dit --name ssd \
+    --privileged --network=host \
+    --device=/dev/kfd --device=/dev/dri \
+    --ipc=host --shm-size 64G --group-add video \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v /home:/home flashinfer-0.5.3.amd2_rocm7.2 /bin/bash
+docker exec -u 0 -it ssd bash
+```
+
+**3. Activate the env and install SSD + flash-attn**:
+
+```bash
+export MAMBA_EXE=/bin/micromamba MAMBA_ROOT_PREFIX=/opt/conda
+eval "$($MAMBA_EXE shell hook --shell bash)"
+micromamba activate flashinfer-py3.12-torch2.9.1-rocm7.2
+
+cd /path/to/ssd
+bash setup_rocm.sh
+```
+
+`setup_rocm.sh` runs `pip install -e .` and builds `flash-attn` from
+upstream commit `0f82fea` (overridable via `FLASH_ATTN_REF`) with the CK
+backend for `gfx942`.
+
+Tree-decode backend is selectable via `SSD_TREE_DECODE_BACKEND={flashinfer,sdpa}`
+(default: `flashinfer`).
+
 ## Usage
 
 All commands below run from inside the `bench/` directory. Large models (Llama-3 70B, Qwen-3 32B) take a few minutes for load/warmup/compile before generation starts. Always use `python -O` to disable debug overhead.
