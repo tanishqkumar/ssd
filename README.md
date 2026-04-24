@@ -78,9 +78,11 @@ Runs on AMD Instinct MI300x with ROCm 7.2, PyTorch 2.9.1, and
 **1. Build the Docker image** (from the FlashInfer release source):
 
 ```bash
+git clone https://github.com/tanishqkumar/ssd /home/yourname/ssd && cd /home/yourname/ssd
+
 git clone --branch v0.5.3+amd.2 --depth 1 \
-    https://github.com/ROCm/flashinfer.git /tmp/flashinfer-build
-cd /tmp/flashinfer-build
+    https://github.com/ROCm/flashinfer.git /home/yourname/tmp/flashinfer-build
+cd /home/yourname/tmp/flashinfer-build
 docker build \
     --build-arg ROCM_VERSION=7.2 \
     --build-arg PY_VERSION=3.12 \
@@ -92,23 +94,33 @@ docker build \
 **2. Start and enter the container**:
 
 ```bash
-docker run -dit --name ssd \
-    --privileged --network=host \
-    --device=/dev/kfd --device=/dev/dri \
-    --ipc=host --shm-size 64G --group-add video \
-    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-    -v /home:/home flashinfer-0.5.3.amd2_rocm7.2 /bin/bash
+docker run -dit \
+  --name ssd \
+  --privileged --network=host \
+  --device=/dev/kfd --device=/dev/dri \
+  --ipc=host --shm-size 64G \
+  --group-add video \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  -v /home:/home \
+  flashinfer-0.5.3.amd2_rocm7.2 \
+  /bin/bash
 docker exec -u 0 -it ssd bash
 ```
 
 **3. Activate the env and install SSD + flash-attn**:
 
 ```bash
-export MAMBA_EXE=/bin/micromamba MAMBA_ROOT_PREFIX=/opt/conda
+export MAMBA_EXE=/bin/micromamba
+export MAMBA_ROOT_PREFIX=/opt/conda
 eval "$($MAMBA_EXE shell hook --shell bash)"
 micromamba activate flashinfer-py3.12-torch2.9.1-rocm7.2
 
-cd /path/to/ssd
+pip install --no-build-isolation -ve /home/yourname/tmp/flashinfer-build
+python -c "import torch; print(torch.__version__)"       # should print 2.9.1+...
+python -c "import flashinfer; print(flashinfer.__version__)"  # should print a version string
+
+cd /home/yourname/ssd
 bash setup_rocm.sh
 ```
 
@@ -118,6 +130,31 @@ backend for `gfx942`.
 
 Tree-decode backend is selectable via `SSD_TREE_DECODE_BACKEND={flashinfer,sdpa}`
 (default: `flashinfer`).
+
+**4: Download models and datasets**
+
+```bash
+# Set environment variables
+export SSD_HF_CACHE=/path/to/huggingface/hub    # e.g. /home/<your-username>/hf_cache
+export SSD_DATASET_DIR=$SSD_HF_CACHE/processed_datasets
+export HSA_NO_SCRATCH_RECLAIM=1
+
+# Login to HuggingFace (needed for gated models like Llama)
+pip install huggingface_hub datasets
+huggingface-cli login
+
+# Download models
+huggingface-cli download meta-llama/Llama-3.1-8B-Instruct --cache-dir $SSD_HF_CACHE
+huggingface-cli download meta-llama/Llama-3.2-1B-Instruct --cache-dir $SSD_HF_CACHE
+
+# For 70B benchmarks (requires ~140GB disk):
+huggingface-cli download meta-llama/Llama-3.1-70B-Instruct --cache-dir $SSD_HF_CACHE
+
+# Download and preprocess benchmark datasets
+HF_DATASETS_CACHE=$SSD_HF_CACHE python scripts/get_data_from_hf.py
+```
+
+The dataset script downloads HumanEval, Alpaca, C4, GSM8K, and UltraFeedback, then saves processed JSONL files to `$SSD_DATASET_DIR`.
 
 ## Usage
 
