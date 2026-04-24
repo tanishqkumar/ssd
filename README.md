@@ -75,11 +75,17 @@ Runs on AMD Instinct MI300x with ROCm 7.2, PyTorch 2.9.1, and
 [FlashInfer v0.5.3+amd.2](https://github.com/ROCm/flashinfer/releases/tag/v0.5.3%2Bamd.2)
 (ships [PR #214](https://github.com/ROCm/flashinfer/pull/214) kernel fixes).
 
-**1. Build the Docker image** (from the FlashInfer release source):
+**1: Clone the repo**：
 
 ```bash
-git clone https://github.com/tanishqkumar/ssd /home/yourname/ssd && cd /home/yourname/ssd
+cd /home/<your-username>
+git clone https://github.com/tanishqkumar/ssd
+cd ssd
+```
 
+**2. Build the Docker image** (from the FlashInfer release source):
+
+```bash
 git clone --branch v0.5.3+amd.2 --depth 1 \
     https://github.com/ROCm/flashinfer.git /home/yourname/tmp/flashinfer-build
 cd /home/yourname/tmp/flashinfer-build
@@ -91,7 +97,7 @@ docker build \
     -f .devcontainer/rocm/Dockerfile .
 ```
 
-**2. Start and enter the container**:
+**3. Start and enter the container**:
 
 ```bash
 docker run -dit \
@@ -108,18 +114,23 @@ docker run -dit \
 docker exec -u 0 -it ssd bash
 ```
 
-**3. Activate the env and install SSD + flash-attn**:
+**4. Activate the env and install SSD + flash-attn**:
 
 ```bash
+# Activate the micromamba environment
 export MAMBA_EXE=/bin/micromamba
 export MAMBA_ROOT_PREFIX=/opt/conda
 eval "$($MAMBA_EXE shell hook --shell bash)"
 micromamba activate flashinfer-py3.12-torch2.9.1-rocm7.2
 
+# Install FlashInfer from the source used to build the Docker
 pip install --no-build-isolation -ve /home/yourname/tmp/flashinfer-build
+
+#Verify the install:
 python -c "import torch; print(torch.__version__)"       # should print 2.9.1+...
 python -c "import flashinfer; print(flashinfer.__version__)"  # should print a version string
 
+# Install SSD and build flash-attn
 cd /home/yourname/ssd
 bash setup_rocm.sh
 ```
@@ -131,7 +142,7 @@ backend for `gfx942`.
 Tree-decode backend is selectable via `SSD_TREE_DECODE_BACKEND={flashinfer,sdpa}`
 (default: `flashinfer`).
 
-**4: Download models and datasets**
+**5: Download models and datasets**
 
 ```bash
 # Set environment variables
