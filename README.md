@@ -28,67 +28,54 @@ This custom inference engine supports:
 
 ## Setup
 
-Requirements: Python 3.11+, CUDA >= 12.8. This code was written and tested on H100s. 
+### Requirements
 
-If `uv` is not installed:
+Python 3.11+, CUDA >= 12.8. This code was written and tested on H100s.
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# if `uv` is not found in this shell:
-export PATH="$HOME/.local/bin:$PATH"
-```
+AMD GPUs are also supported via ROCm 7.2 and have been tested on MI300x.
 
-Then: 
+### Step 1 — Clone the repo
 
 ```bash
 git clone https://github.com/tanishqkumar/ssd && cd ssd
+```
+
+### Step 2 — Install dependencies
+
+Pick **one** of the two paths below.
+
+<details open>
+<summary><b>Option A: NVIDIA (CUDA)</b></summary>
+
+Install [`uv`](https://github.com/astral-sh/uv) if you don't have it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then sync and activate:
+
+```bash
 uv sync                    # core SSD deps
-# uv sync --extra scripts  # add deps used by scripts/
 source .venv/bin/activate
 python -c "from ssd import LLM; print('ok')"
 ```
 
-Set paths via environment variables. `SSD_HF_CACHE` should point to the HuggingFace **hub** directory — this is the directory that contains `models--org--name/` subdirectories (e.g. `/data/huggingface/hub`, not `/data/huggingface/`). `SSD_DATASET_DIR` should point to the directory containing the dataset subdirectories (`humaneval/`, `alpaca/`, etc).
+</details>
 
-```bash
-export SSD_HF_CACHE=/path/to/huggingface/hub
-export SSD_DATASET_DIR=/path/to/processed_datasets
-export SSD_CUDA_ARCH=9.0   # 9.0=H100, 8.0=A100, 8.9=L40/4090
-```
+<details>
+<summary><b>Option B: AMD (ROCm / MI300x)</b></summary>
 
-### Download models + datasets
+Requires Docker. Uses PyTorch 2.9.1 and
+[FlashInfer v0.5.3+amd.2](https://github.com/ROCm/flashinfer/releases/tag/v0.5.3%2Bamd.2).
 
-If you already have the models downloaded via `huggingface-cli` or similar, you can skip straight to datasets — just make sure `SSD_HF_CACHE` points to the right place. The download scripts require the `scripts` extra: `uv sync --extra scripts`.
-
-```bash
-# models (uses SSD_HF_CACHE)
-python scripts/download_from_hf.py llama
-
-# datasets (writes to $HF_DATASETS_CACHE/processed_datasets)
-export HF_DATASETS_CACHE=/path/to  # parent of SSD_DATASET_DIR
-python scripts/get_data_from_hf.py --num-samples 10000
-```
-
-## Setup (AMD MI300x / ROCm)
-
-Runs on AMD Instinct MI300x with ROCm 7.2, PyTorch 2.9.1, and
-[FlashInfer v0.5.3+amd.2](https://github.com/ROCm/flashinfer/releases/tag/v0.5.3%2Bamd.2)
-(ships [PR #214](https://github.com/ROCm/flashinfer/pull/214) kernel fixes).
-
-**1: Clone the repo**：
-
-```bash
-cd /home/<your-username>
-git clone https://github.com/tanishqkumar/ssd
-cd ssd
-```
-
-**2. Build the Docker image** (from the FlashInfer release source):
+**Build the Docker image** (from the FlashInfer release source):
 
 ```bash
 git clone --branch v0.5.3+amd.2 --depth 1 \
-    https://github.com/ROCm/flashinfer.git /home/<your-username>/tmp/flashinfer-build
-cd /home/<your-username>/tmp/flashinfer-build
+    https://github.com/ROCm/flashinfer.git $HOME/tmp/flashinfer-build
+cd $HOME/tmp/flashinfer-build
 docker build \
     --build-arg ROCM_VERSION=7.2 \
     --build-arg PY_VERSION=3.12 \
@@ -97,7 +84,7 @@ docker build \
     -f .devcontainer/rocm/Dockerfile .
 ```
 
-**3. Start and enter the container**:
+**Start and enter the container**:
 
 ```bash
 docker run -dit \
@@ -114,56 +101,69 @@ docker run -dit \
 docker exec -u 0 -it ssd bash
 ```
 
-**4. Activate the env and install SSD + flash-attn**:
+**Inside the container**, activate the environment and install:
 
 ```bash
-# Activate the micromamba environment
 export MAMBA_EXE=/bin/micromamba
 export MAMBA_ROOT_PREFIX=/opt/conda
 eval "$($MAMBA_EXE shell hook --shell bash)"
 micromamba activate flashinfer-py3.12-torch2.9.1-rocm7.2
 
-# Install FlashInfer from the source used to build the Docker
-pip install --no-build-isolation -ve /home/<your-username>/tmp/flashinfer-build
+pip install --no-build-isolation -ve $HOME/tmp/flashinfer-build
 
-#Verify the install:
-python -c "import torch; print(torch.__version__)"       # should print 2.9.1+...
-python -c "import flashinfer; print(flashinfer.__version__)"  # should print a version string
-
-# Install SSD and build flash-attn
-cd /home/<your-username>/ssd
+cd $HOME/ssd
 bash setup_rocm.sh
 ```
 
-`setup_rocm.sh` runs `pip install -e .` and builds `flash-attn` from
-upstream commit `0f82fea` (overridable via `FLASH_ATTN_REF`) with the CK
-backend for `gfx942`.
+`setup_rocm.sh` runs `pip install -e .` and builds `flash-attn` from source
+with the CK backend for `gfx942`.
 
 Tree-decode backend is selectable via `SSD_TREE_DECODE_BACKEND={flashinfer,sdpa}`
 (default: `flashinfer`).
 
-**5: Download models and datasets**
+Verify the install:
 
 ```bash
-# Set environment variables
-export SSD_HF_CACHE=/path/to/huggingface/hub    # e.g. /home/<your-username>/hf_cache
-export SSD_DATASET_DIR=$SSD_HF_CACHE/processed_datasets
-export HSA_NO_SCRATCH_RECLAIM=1
+python -c "import torch; print(torch.__version__)"            # 2.9.1+...
+python -c "import flashinfer; print(flashinfer.__version__)"   # version string
+python -c "from ssd import LLM; print('ok')"
+```
 
-# Login to HuggingFace (needed for gated models like Llama)
-pip install huggingface_hub datasets
+</details>
+
+### Step 3 — Set environment variables
+
+`SSD_HF_CACHE` should point to the HuggingFace **hub** directory — the directory that contains `models--org--name/` subdirectories (e.g. `/data/huggingface/hub`, not `/data/huggingface/`). `SSD_DATASET_DIR` should point to the directory containing the dataset subdirectories (`humaneval/`, `alpaca/`, etc).
+
+```bash
+export SSD_HF_CACHE=/path/to/huggingface/hub
+export SSD_DATASET_DIR=/path/to/processed_datasets
+export SSD_CUDA_ARCH=9.0   # 9.0=H100, 8.0=A100, 8.9=L40/4090 (auto-detected on ROCm)
+```
+
+On ROCm set:
+
+```bash
+export HSA_NO_SCRATCH_RECLAIM=1
+```
+
+### Step 4 — Download models + datasets
+
+If you already have models downloaded via `huggingface-cli` or similar, skip straight to datasets — just make sure `SSD_HF_CACHE` points to the right place.
+
+```bash
+# Login (needed for gated models like Llama)
 huggingface-cli login
 
-# Download models
-huggingface-cli download meta-llama/Llama-3.1-8B-Instruct --cache-dir $SSD_HF_CACHE
-huggingface-cli download meta-llama/Llama-3.2-1B-Instruct --cache-dir $SSD_HF_CACHE
-
-# For 70B benchmarks (requires ~140GB disk):
-huggingface-cli download meta-llama/Llama-3.1-70B-Instruct --cache-dir $SSD_HF_CACHE
+# Download models (uses SSD_HF_CACHE)
+python scripts/download_from_hf.py llama
 
 # Download and preprocess benchmark datasets
-HF_DATASETS_CACHE=$SSD_HF_CACHE python scripts/get_data_from_hf.py
+export HF_DATASETS_CACHE=/path/to  # parent of SSD_DATASET_DIR
+python scripts/get_data_from_hf.py --num-samples 10000
 ```
+
+If the download scripts are missing dependencies, install them with `pip install huggingface_hub datasets`.
 
 The dataset script downloads HumanEval, Alpaca, C4, GSM8K, and UltraFeedback, then saves processed JSONL files to `$SSD_DATASET_DIR`.
 
