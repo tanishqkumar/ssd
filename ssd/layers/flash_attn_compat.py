@@ -13,7 +13,11 @@ try:
     from flash_attn import flash_attn_varlen_func as _fa_varlen, flash_attn_with_kvcache as _fa_kvcache
     HAS_FLASH_ATTN = True
 except ImportError:
-    HAS_FLASH_ATTN = False
+    try:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func as _fa_varlen, flash_attn_with_kvcache as _fa_kvcache
+        HAS_FLASH_ATTN = True
+    except ImportError:
+        HAS_FLASH_ATTN = False
 
 
 def flash_attn_varlen_func(

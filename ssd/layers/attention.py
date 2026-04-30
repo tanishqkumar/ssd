@@ -4,13 +4,17 @@ from torch import nn
 import triton
 import triton.language as tl
 
+_ATTN_BACKEND = None
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    _ATTN_BACKEND = "flash_attn"
 except ImportError:
     try:
         from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+        _ATTN_BACKEND = "sgl_kernel"
     except ImportError:
         from ssd.layers.flash_attn_compat import flash_attn_varlen_func, flash_attn_with_kvcache
+        _ATTN_BACKEND = "sdpa_compat"
 from ssd.utils.context import get_context
 
 
@@ -148,26 +152,48 @@ class Attention(nn.Module):
 
             if verify_or_glue:
                 assert context.context_lens is not None
-                batch_size = context.context_lens.shape[0]
-                q = q.reshape(batch_size, context.max_seqlen_q, self.num_heads, self.head_dim)
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True,
-                                        )
+                if _ATTN_BACKEND == "sgl_kernel":
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, page_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True,
+                                            cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
+                                            )
+                else:
+                    batch_size = context.context_lens.shape[0]
+                    q = q.reshape(batch_size, context.max_seqlen_q, self.num_heads, self.head_dim)
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True,
+                                            )
 
             elif tree_decode:
                 if getattr(context, 'custom_mask', None) is not None:
                     o = self._tree_decode_sdpa(q, context)
+                elif self.only_prefill_wrapper is not None:
+                    prefill_wrapper = self.only_prefill_wrapper
+                    o = prefill_wrapper.run(q, (self.k_cache, self.v_cache))
                 else:
-                    wrapper = (getattr(context, 'prefill_wrapper', None)
-                               or self.only_prefill_wrapper)
-                    o = wrapper.run(q, (self.k_cache, self.v_cache))
+                    mq_len = self.F * (self.K+1)
+                    bs = q.shape[0] // mq_len
+                    wrapper_bs = None
+                    for available_bs in sorted(self.prefill_wrappers.keys()):
+                        if available_bs >= bs:
+                            wrapper_bs = available_bs
+                            break
+                    prefill_wrapper = self.prefill_wrappers[wrapper_bs]
+                    o = prefill_wrapper.run(q, (self.k_cache, self.v_cache))
             else: # single query decode
                 q = q.unsqueeze(1)
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
-                                            softmax_scale=self.scale, causal=True,
-                                            )
+                if _ATTN_BACKEND == "sgl_kernel":
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                                cache_seqlens=context.context_lens, page_table=context.block_tables,
+                                                softmax_scale=self.scale, causal=True,
+                                                )
+                else:
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                                cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                                softmax_scale=self.scale, causal=True,
+                                                )
 
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
