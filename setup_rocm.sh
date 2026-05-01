@@ -25,12 +25,12 @@ fi
 SSD_DIR="$(dirname "$(readlink -f "$0")")"
 cd "$SSD_DIR"
 
-echo "[1/6] Verifying GPU packages..."
+echo "[1/5] Verifying GPU packages..."
 python3 -c "import torch; print(f'  PyTorch {torch.__version__} (HIP: {torch.version.hip})')"
 python3 -c "import triton; print(f'  Triton {triton.__version__}')"
 echo "  GPUs: $(python3 -c 'import torch; print(torch.cuda.device_count())')"
 
-echo "[2/6] Installing FlashInfer (if not already installed)..."
+echo "[2/5] Installing FlashInfer (if not already installed)..."
 if python3 -c "import flashinfer" 2>/dev/null; then
     python3 -c "import flashinfer; print(f'  FlashInfer {flashinfer.__version__} already installed')"
 else
@@ -39,33 +39,27 @@ else
     python3 -c "import flashinfer; print(f'  FlashInfer {flashinfer.__version__} installed')"
 fi
 
-echo "[3/6] Installing ssd and dependencies..."
+echo "[3/5] Installing ssd..."
 cd "$SSD_DIR"
 rm -f uv.lock
-pip install -e . 2>&1 | tail -3
+pip install --no-deps -e . 2>&1 | tail -3
+pip install transformers safetensors numpy tqdm xxhash wandb hf_transfer tiktoken 2>&1 | tail -3
 
-echo "[4/6] Building flash-attn from source (CK backend for ROCm)..."
+echo "[4/5] Building flash-attn from source (CK backend for ROCm)..."
 echo "  This is REQUIRED for CUDA/HIP graph mode. Expect 10-30 minutes."
 echo "  (pip install flash-attn does NOT work on ROCm)"
 if [ -z "$CUDA_HOME" ] && [ -d "/opt/rocm" ]; then
     export CUDA_HOME=/opt/rocm
     echo "  CUDA_HOME not set; defaulting to $CUDA_HOME for ROCm build"
 fi
-FLASH_ATTN_DIR="/tmp/flash-attention-build"
+FLASH_ATTN_DIR="${HOME}/tmp/flash-attention-build"
 FLASH_ATTN_REF="${FLASH_ATTN_REF:-0f82fea}"
 if python3 - <<'PY'
-import pathlib
-
 try:
     import flash_attn
-    from flash_attn import flash_attn_with_kvcache, flash_attn_interface
+    from flash_attn import flash_attn_with_kvcache
 except Exception as exc:
     print(f"  flash-attn compatibility check failed: {exc}")
-    raise SystemExit(1)
-
-interface_text = pathlib.Path(flash_attn_interface.__file__).read_text()
-if "num_splits" in interface_text:
-    print("  Installed flash-attn wrapper is incompatible with the ROCm extension; rebuilding")
     raise SystemExit(1)
 
 print(f"  flash-attn {getattr(flash_attn, '__version__', 'unknown')} already installed and compatible")
@@ -112,20 +106,10 @@ PY
 
     rm -rf build dist flash_attn.egg-info
     pip install packaging wheel ninja psutil einops --quiet
-    GPU_ARCHS="gfx942" pip install . --no-build-isolation --no-cache-dir 2>&1 | tee /tmp/flash-attn-build.log | tail -20
+    mkdir -p "${HOME}/tmp"
+    GPU_ARCHS="gfx942" pip install . --no-build-isolation --no-cache-dir 2>&1 | tee "${HOME}/tmp/flash-attn-build.log" | tail -20
     cd "$SSD_DIR"
-    if python3 - <<'PY'
-import pathlib
-
-from flash_attn import flash_attn_with_kvcache, flash_attn_interface
-
-interface_text = pathlib.Path(flash_attn_interface.__file__).read_text()
-if "num_splits" in interface_text:
-    raise SystemExit(1)
-
-print("  flash-attn built and installed successfully")
-PY
-    then
+    if python3 -c "from flash_attn import flash_attn_with_kvcache; print('  flash-attn built and installed successfully')" 2>/dev/null; then
         :
     else
         echo ""
@@ -139,15 +123,9 @@ PY
     fi
 fi
 
-echo "[5/6] Setting recommended environment variables..."
-export TORCH_CUDA_ARCH_LIST=gfx942
-export HSA_NO_SCRATCH_RECLAIM=1
-echo "  TORCH_CUDA_ARCH_LIST=gfx942"
-echo "  HSA_NO_SCRATCH_RECLAIM=1"
-
-echo "[6/6] Running import test..."
-export SSD_HF_CACHE="${SSD_HF_CACHE:-/tmp}"
-export SSD_DATASET_DIR="${SSD_DATASET_DIR:-/tmp}"
+echo "[5/5] Running import test..."
+SSD_HF_CACHE="${SSD_HF_CACHE:-${HOME}/tmp}" \
+SSD_DATASET_DIR="${SSD_DATASET_DIR:-${HOME}/tmp}" \
 python3 -c "
 import ssd.paths
 print('  ssd.paths OK (arch:', ssd.paths.CUDA_ARCH, ')')

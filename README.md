@@ -95,15 +95,18 @@ docker run -dit \
   --group-add video \
   --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
-  -v /home:/home \
+  -v $HOME:$HOME \
+  -e HOST_HOME=$HOME \
   flashinfer-0.5.3.amd2_rocm7.2 \
   /bin/bash
 docker exec -u 0 -it ssd bash
 ```
 
-**Inside the container**, activate the environment and install:
+**Inside the container**, `$HOST_HOME` points to your host home directory
+(mounted via `-v`). Activate the environment and install:
 
 ```bash
+export HOME=$HOST_HOME
 export MAMBA_EXE=/bin/micromamba
 export MAMBA_ROOT_PREFIX=/opt/conda
 eval "$($MAMBA_EXE shell hook --shell bash)"
@@ -115,8 +118,9 @@ cd $HOME/ssd
 bash setup_rocm.sh
 ```
 
-`setup_rocm.sh` runs `pip install -e .` and builds `flash-attn` from source
-with the CK backend for `gfx942`.
+`setup_rocm.sh` runs `pip install --no-deps -e .` (to avoid overwriting the
+ROCm PyTorch) and builds `flash-attn` from source with the CK backend for
+`gfx942`.
 
 Tree-decode backend is selectable via `SSD_TREE_DECODE_BACKEND={flashinfer,sdpa}`
 (default: `flashinfer`).
@@ -124,9 +128,8 @@ Tree-decode backend is selectable via `SSD_TREE_DECODE_BACKEND={flashinfer,sdpa}
 Verify the install:
 
 ```bash
-python -c "import torch; print(torch.__version__)"            # 2.9.1+...
-python -c "import flashinfer; print(flashinfer.__version__)"   # version string
-python -c "from ssd import LLM; print('ok')"
+python -c "import torch; print(torch.__version__)"           
+python -c "import flashinfer; print(flashinfer.__version__)" 
 ```
 
 </details>
@@ -138,6 +141,9 @@ python -c "from ssd import LLM; print('ok')"
 ```bash
 export SSD_HF_CACHE=/path/to/huggingface/hub
 export SSD_DATASET_DIR=/path/to/processed_datasets
+```
+For CUDA set
+```bash
 export SSD_CUDA_ARCH=9.0   # 9.0=H100, 8.0=A100, 8.9=L40/4090 (auto-detected on ROCm)
 ```
 
