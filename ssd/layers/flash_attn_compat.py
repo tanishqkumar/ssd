@@ -13,10 +13,14 @@ try:
     from flash_attn import flash_attn_varlen_func as _fa_varlen, flash_attn_with_kvcache as _fa_kvcache
     HAS_FLASH_ATTN = True
 except ImportError:
-    try:
-        from sgl_kernel.flash_attn import flash_attn_varlen_func as _fa_varlen, flash_attn_with_kvcache as _fa_kvcache
-        HAS_FLASH_ATTN = True
-    except ImportError:
+    _on_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    if not _on_rocm:
+        try:
+            from sgl_kernel.flash_attn import flash_attn_varlen_func as _fa_varlen, flash_attn_with_kvcache as _fa_kvcache
+            HAS_FLASH_ATTN = True
+        except ImportError:
+            HAS_FLASH_ATTN = False
+    else:
         HAS_FLASH_ATTN = False
 
 

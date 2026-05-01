@@ -5,14 +5,19 @@ import triton
 import triton.language as tl
 
 _ATTN_BACKEND = None
+_on_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
     _ATTN_BACKEND = "flash_attn"
 except ImportError:
-    try:
-        from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-        _ATTN_BACKEND = "sgl_kernel"
-    except ImportError:
+    if not _on_rocm:
+        try:
+            from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+            _ATTN_BACKEND = "sgl_kernel"
+        except ImportError:
+            from ssd.layers.flash_attn_compat import flash_attn_varlen_func, flash_attn_with_kvcache
+            _ATTN_BACKEND = "sdpa_compat"
+    else:
         from ssd.layers.flash_attn_compat import flash_attn_varlen_func, flash_attn_with_kvcache
         _ATTN_BACKEND = "sdpa_compat"
 from ssd.utils.context import get_context
