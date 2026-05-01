@@ -159,7 +159,7 @@ If you already have models downloaded via `huggingface-cli` or similar, skip str
 
 ```bash
 # Login (needed for gated models like Llama)
-huggingface-cli login
+hf auth login
 
 # Download models (uses SSD_HF_CACHE)
 python scripts/download_from_hf.py llama

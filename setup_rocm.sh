@@ -43,7 +43,7 @@ echo "[3/5] Installing ssd..."
 cd "$SSD_DIR"
 rm -f uv.lock
 pip install --no-deps -e . 2>&1 | tail -3
-pip install transformers safetensors numpy tqdm xxhash wandb hf_transfer tiktoken 2>&1 | tail -3
+pip install transformers safetensors numpy tqdm xxhash wandb hf_transfer tiktoken datasets huggingface_hub 2>&1 | tail -3
 
 echo "[4/5] Building flash-attn from source (CK backend for ROCm)..."
 echo "  This is REQUIRED for CUDA/HIP graph mode. Expect 10-30 minutes."
