@@ -47,6 +47,10 @@ pip install -e . 2>&1 | tail -3
 echo "[4/6] Building flash-attn from source (CK backend for ROCm)..."
 echo "  This is REQUIRED for CUDA/HIP graph mode. Expect 10-30 minutes."
 echo "  (pip install flash-attn does NOT work on ROCm)"
+if [ -z "$CUDA_HOME" ] && [ -d "/opt/rocm" ]; then
+    export CUDA_HOME=/opt/rocm
+    echo "  CUDA_HOME not set; defaulting to $CUDA_HOME for ROCm build"
+fi
 FLASH_ATTN_DIR="/tmp/flash-attention-build"
 FLASH_ATTN_REF="${FLASH_ATTN_REF:-0f82fea}"
 if python3 - <<'PY'
