@@ -169,7 +169,12 @@ export HF_DATASETS_CACHE=/path/to  # parent of SSD_DATASET_DIR
 python scripts/get_data_from_hf.py --num-samples 10000
 ```
 
-If the download scripts are missing dependencies, install them with `python -m pip install huggingface_hub datasets`.
+If the download scripts are missing dependencies, install them with:
+
+```bash
+python -m ensurepip --upgrade
+python -m pip install huggingface_hub datasets
+```
 
 The dataset script downloads HumanEval, Alpaca, C4, GSM8K, and UltraFeedback, then saves processed JSONL files to `$SSD_DATASET_DIR`.
 

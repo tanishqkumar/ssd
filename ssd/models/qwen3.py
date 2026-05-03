@@ -66,6 +66,9 @@ class Qwen3Attention(nn.Module):
             tp_group=self.tp_group,
             tp_size=self.tp_size,
         )
+        if rope_scaling is not None:
+            rope_scaling = None
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
