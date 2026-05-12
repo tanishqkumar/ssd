@@ -40,7 +40,27 @@ AMD GPUs are also supported via ROCm 7.2 and have been tested on MI300x.
 git clone https://github.com/tanishqkumar/ssd && cd ssd
 ```
 
-### Step 2 — Install dependencies
+### Step 2 — Set environment variables
+
+`SSD_HF_CACHE` should point to the HuggingFace **hub** directory — the directory that contains `models--org--name/` subdirectories (e.g. `/data/huggingface/hub`, not `/data/huggingface/`). `SSD_DATASET_DIR` should point to the directory containing the dataset subdirectories (`humaneval/`, `alpaca/`, etc).
+
+```bash
+export SSD_HF_CACHE=/path/to/huggingface/hub
+export SSD_DATASET_DIR=/path/to/processed_datasets
+```
+For CUDA set
+```bash
+export SSD_CUDA_ARCH=9.0   # 9.0=H100, 8.0=A100, 8.9=L40/4090 (auto-detected on ROCm)
+```
+
+On ROCm set:
+
+```bash
+export HSA_NO_SCRATCH_RECLAIM=1
+```
+
+
+### Step 3 — Install dependencies
 
 Pick **one** of the two paths below.
 
@@ -134,24 +154,6 @@ python -c "import flashinfer; print(flashinfer.__version__)"
 
 </details>
 
-### Step 3 — Set environment variables
-
-`SSD_HF_CACHE` should point to the HuggingFace **hub** directory — the directory that contains `models--org--name/` subdirectories (e.g. `/data/huggingface/hub`, not `/data/huggingface/`). `SSD_DATASET_DIR` should point to the directory containing the dataset subdirectories (`humaneval/`, `alpaca/`, etc).
-
-```bash
-export SSD_HF_CACHE=/path/to/huggingface/hub
-export SSD_DATASET_DIR=/path/to/processed_datasets
-```
-For CUDA set
-```bash
-export SSD_CUDA_ARCH=9.0   # 9.0=H100, 8.0=A100, 8.9=L40/4090 (auto-detected on ROCm)
-```
-
-On ROCm set:
-
-```bash
-export HSA_NO_SCRATCH_RECLAIM=1
-```
 
 ### Step 4 — Download models + datasets
 
