@@ -209,6 +209,9 @@ Use `--qwen --size 32` for Qwen models. See `bench/bench.py` for full args. For 
 Interactive streaming chat with Llama-3.1 70B only. Supports AR, sync SD, and async SD (SSD). Pass `--metrics` to print token count, speed, and TTFT after each response.
 
 ```bash
+
+export TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING=false
+export TRANSFORMERS_VERBOSITY=error
 cd bench
 
 # AR — 4 GPUs
