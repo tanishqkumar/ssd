@@ -86,7 +86,7 @@ class SpeculatorAsync(SpeculatorBase):
         send_int64(self.async_pg, self.draft_runner_rank,
                    input_ids, num_tokens, draft_block_table.to(torch.int64))
         if eagle_acts is not None:
-            dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
+            dist.send(eagle_acts.to(self.draft_dtype), dst=self.draft_runner_rank, group=self.async_pg)
         return SpeculateResult([], [])
 
     def speculate(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
