@@ -80,4 +80,4 @@ By opening a PR, you agree your contribution is licensed under the terms in [LIC
 
 This repo is part of the AMD-AGI org. Non-AMD contributors need admin approval before being added as collaborators and must follow AMD's [open-source contribution guidelines](#).
 
-For security issues, do **not** open a public issue. Report them privately to the repository maintainers.
+For security issues, do **not** open a public issue. See [SECURITY.md](SECURITY.md) for private reporting options.
