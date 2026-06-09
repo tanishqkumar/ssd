@@ -175,6 +175,7 @@ def load_dataset_token_ids(
                     tokens = tokenizer.apply_chat_template(
                         [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": text}],
                         add_generation_prompt=True,
+                        return_dict=False,
                     )
                 else:
                     tokens = tokenizer.encode(text, add_special_tokens=False)

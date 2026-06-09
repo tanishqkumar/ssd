@@ -84,7 +84,7 @@ def ssd_chat(args):
             break
 
         history.append({"role": "user", "content": user_input})
-        token_ids = tokenizer.apply_chat_template(history, add_generation_prompt=True, tokenize=True)
+        token_ids = tokenizer.apply_chat_template(history, add_generation_prompt=True, tokenize=True, return_dict=False)
         sp = SamplingParams(temperature=args.temp, max_new_tokens=args.output_len, ignore_eos=args.ignore_eos)
 
         parent_conn, child_conn = mp.Pipe()
@@ -183,7 +183,7 @@ def server_chat(args):
                 break
 
             history.append({"role": "user", "content": user_input})
-            token_ids = tokenizer.apply_chat_template(history, add_generation_prompt=True, tokenize=True)
+            token_ids = tokenizer.apply_chat_template(history, add_generation_prompt=True, tokenize=True, return_dict=False)
             payload = {"model": TARGET, "prompt": token_ids,
                        "temperature": args.temp, "max_tokens": args.output_len,
                        "stream": True, "stream_options": {"include_usage": True}}

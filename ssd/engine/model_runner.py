@@ -97,24 +97,36 @@ class ModelRunner:
 
         if should_use_dist: 
             default_port = 1223 
+            print(f'[rank {self.rank} draft={is_draft}] before init_process_group (ws={self.world_size})', flush=True)
             dist.init_process_group(
                 "nccl", f"tcp://localhost:{default_port}",
                 world_size=self.world_size,
                 rank=self.rank,
                 device_id=self.device,
             )
+            print(f'[rank {self.rank} draft={is_draft}] after init_process_group', flush=True)
 
-            self.tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus))) # everyone should see the new_group init even if not in group 
+            self.tp_pg = dist.new_group(ranks=list(range(self.num_tp_gpus)))
+            print(f'[rank {self.rank} draft={is_draft}] after NCCL tp_pg new_group', flush=True)
 
+            if not (self.is_draft and self.draft_async) and self.rank < self.num_tp_gpus:
+                tp_ranks = list(range(self.num_tp_gpus))
+                self.tp_gloo_pg = dist.new_group(
+                    ranks=tp_ranks, backend="gloo",
+                    use_local_synchronization=True,
+                )
+                print(f'[rank {self.rank} draft={is_draft}] after gloo tp_gloo_pg (local sync)', flush=True)
+
+        print(f'[rank {self.rank} draft={is_draft}] past dist block', flush=True)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.hf_config.torch_dtype)
         torch.set_default_device("cuda")
         
         if self.is_draft:
             assert num_tp_gpus == 1, "ERROR in ModelRunner: draft should have tp_size=1"
-            self.tp_pg = None # every rank is given an object from self.tp_pg, even tho draft doesnt participate it gets GROUP_NON_MEMBER object != None back, so we can't assert None here, we 
+            self.tp_pg = None
         
-        print(f'[model_runner] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}', flush=True)
+        print(f'[model_runner rank={self.rank} draft={is_draft}] about to setup and warmup model and cudagraphs, is use_eagle={self.use_eagle}', flush=True)
         model_type = self.setup_and_warmup_model_and_cudagraphs(config, self.hf_config, init_q, is_draft)
 
         if self.verbose: print(f'-----CAPTURED {model_type}CUDAGRAPH----', flush=True)
@@ -162,7 +174,7 @@ class ModelRunner:
             512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}") 
         
         if self.config.enforce_eager: 
-            self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
+            self.only_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD", backend="fa2")
         else: 
             max_bs = min(self.config.max_num_seqs, 512)
             max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
@@ -194,7 +206,8 @@ class ModelRunner:
             print(f'[model_runner about to wrapper.init()] graph_bs_list={graph_bs_list}', flush=True)
             for bs in graph_bs_list:
                 self.prefill_wrappers[bs] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer, "NHD", 
+                    self.workspace_buffer, "NHD",
+                    backend="fa2",
                     use_cuda_graph=True, 
                     qo_indptr_buf=cu_seqlens_q[:bs + 1],
                     paged_kv_indptr_buf=kv_indptr[:bs + 1],
@@ -255,7 +268,7 @@ class ModelRunner:
         target_hidden_size = getattr(config, 'd_model_target', None)
         load_model(self.model, config.model, target_path=target_path, target_hidden_size=target_hidden_size)
         
-        if config.draft_async:  # move this here so we don't get a timeout waiting for draft rank while load_model happens?
+        if config.draft_async:
             self.async_pg = dist.new_group(ranks=[0, self.draft_rank])
         if self.verbose:
             print(f'-----{model_type}MODEL LOADED----', flush=True)
@@ -271,12 +284,20 @@ class ModelRunner:
             print(f'-----ALLOCATING {model_type}KV CACHE----', flush=True)
         self.allocate_kv_cache()
         if init_q is not None:
-            # super().__init__() runs warmup and calculates num_kvcache_blocks, pass that up
             init_q.put(self.config.num_kvcache_blocks)
             init_q.close()
 
         if not self.enforce_eager:
-            # if not self.is_draft or (self.is_draft and self.config.draft_async and self.config.speculate): 
+            from ssd.layers.flash_attn_compat import HAS_FLASH_ATTN
+            if not HAS_FLASH_ATTN:
+                raise RuntimeError(
+                    "CUDA/HIP graph capture requires the native flash-attn package (CK backend), "
+                    "but it is not installed. The SDPA fallback in flash_attn_compat.py uses .item() "
+                    "calls that are incompatible with graph capture.\n"
+                    "Either:\n"
+                    "  1. Build flash-attn from source: cd flash-attention && GPU_ARCHS=gfx942 pip install . --no-build-isolation\n"
+                    "  2. Or use eager mode: add --eager flag to your benchmark command"
+                )
             decode_graph_vars, decode_graph_pool, decode_graphs, decode_graph_bs_list = capture_cudagraph(self)  # decode cudagraph, draft needs in spec and target in normal
             self.graph_vars["decode"] = decode_graph_vars
             self.graph_pools["decode"] = decode_graph_pool
@@ -288,8 +309,8 @@ class ModelRunner:
                 self.graph_pools["verify"] = verify_graph_pool
                 self.graphs["verify"] = verify_graphs
                 self.graph_bs_list["verify"] = verify_graph_bs_list
-            if self.config.speculate and self.is_draft and self.config.draft_async:
-                fi_tree_decode_graph_vars, fi_tree_decode_graph_pool, fi_tree_decode_graphs, fi_tree_decode_graph_bs_list = capture_fi_tree_decode_cudagraph(self)  # fi tree decode cudagraph, draft only
+            if self.config.speculate and self.is_draft and self.config.draft_async and self.config.tree_decode_backend == "flashinfer":
+                fi_tree_decode_graph_vars, fi_tree_decode_graph_pool, fi_tree_decode_graphs, fi_tree_decode_graph_bs_list = capture_fi_tree_decode_cudagraph(self)
                 self.graph_vars["fi_tree_decode"] = fi_tree_decode_graph_vars
                 self.graph_pools["fi_tree_decode"] = fi_tree_decode_graph_pool
                 self.graphs["fi_tree_decode"] = fi_tree_decode_graphs
@@ -373,11 +394,16 @@ class ModelRunner:
         return
 
     def loop(self):
+        prof = self._maybe_create_profiler()
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
+            if method_name == "run" and prof is not None:
+                prof.step()
             if method_name == "exit":
                 break
+        if prof is not None:
+            prof.stop()
 
     def recv_cmd(self):
         t = torch.empty(1, dtype=torch.int64, device=self.device)
@@ -418,6 +444,48 @@ class ModelRunner:
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
+
+    def _maybe_create_profiler(self):
+        """Create a PyTorch profiler if SSD_TRACE_PATH env var is set.
+
+        Uses on_trace_ready to export per-rank trace files as soon as
+        the active window ends, so they're available for merging before
+        the process exits.
+        """
+        trace_path = os.environ.get("SSD_TRACE_PATH")
+        if not trace_path:
+            return None
+        from torch.profiler import profile, ProfilerActivity, schedule
+        skip = int(os.environ.get("SSD_TRACE_SKIP", "50"))
+        active = int(os.environ.get("SSD_TRACE_STEPS", "2"))
+        wait_steps = max(0, skip - 1)
+        warmup_steps = min(1, skip)
+
+        base, ext = os.path.splitext(trace_path)
+        if self.is_draft:
+            out_path = f"{base}_draft{ext}"
+            role = "draft"
+        else:
+            out_path = f"{base}_rank{self.rank}{ext}"
+            role = f"target rank {self.rank}"
+
+        def _export(p):
+            p.export_chrome_trace(out_path)
+            print(f"[profile] {role}: trace exported to {out_path}", flush=True)
+
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=wait_steps, warmup=warmup_steps,
+                              active=active, repeat=1),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=_export,
+        )
+        prof.start()
+        print(f"[profile] {role}: profiler started "
+              f"(skip={skip}, active={active})", flush=True)
+        return prof
 
     def call(self, method_name, *args):
         if self.num_tp_gpus > 1 and self.rank == 0:
@@ -550,33 +618,78 @@ class ModelRunner:
         return temperatures
 
     def eager_tree_decode_plan(self, input_ids, positions, step, cache_hits):
-        """Plan FlashInfer for tree decode in eager mode"""
+        """Prepare tree decode: compute custom mask and store in context for SDPA attention.
+
+        AMD FlashInfer's BatchPrefill kernel (JIT backend) produces incorrect
+        attention outputs, so we bypass it entirely and use PyTorch SDPA with
+        a padded 2-D mask stored in the context.
+        """
         assert self.is_draft and self.config.draft_async, "ERROR in eager_tree_decode_plan: not a draft async model"
         context = get_context()
-        
+
         K, F = self.config.speculate_k, self.config.async_fan_out
-        # MQ_LEN = F * (K+1)
         MQ_LEN = self.config.MQ_LEN
-        flat_batch_size = input_ids.size(0) 
-        B = flat_batch_size // MQ_LEN # [N] tokens = B * sum(fan_out_list)
-        
-        # Convert block_tables to FlashInfer format
-        block_tables = context.block_tables # [B, M]
-        context_lens = context.context_lens # [B]
-        
-        counts = (context_lens + self.block_size - 1) // self.block_size # [B]
-        kv_indptr = torch.cat([torch.tensor([0], device=block_tables.device),
-                               counts.cumsum(dim=0)]).to(torch.int32)  
-        mask = torch.arange(block_tables.size(1), device=block_tables.device)[None, :] < counts[:, None]
-        kv_indices = block_tables[mask]                    # flattened page ids
-        
-        # Last-page actual token count per request
-        kv_last_page_len = (context_lens % self.block_size)
-        kv_last_page_len[kv_last_page_len == 0] = self.block_size
-        kv_last_page_len = kv_last_page_len.to(torch.int32)
-        cu_seqlens_q = torch.arange(B + 1, device=self.device, dtype=torch.int32) * MQ_LEN # assumes same MQ_LEN across batch dimension 
-        custom_mask = get_custom_mask(self.config, context_lens, step, K, F, B, device=self.device, cache_hits=cache_hits)
-        
+        flat_batch_size = input_ids.size(0)
+        B = flat_batch_size // MQ_LEN
+
+        block_tables = context.block_tables
+        context_lens = context.context_lens
+
+        custom_mask_flat = get_custom_mask(self.config, context_lens, step, K, F, B, device=self.device, cache_hits=cache_hits)
+
+        max_kv = int(context_lens.max().item())
+        mask_2d = torch.zeros(B, MQ_LEN, max_kv, dtype=torch.bool, device=self.device)
+        offset = 0
+        for b in range(B):
+            kv_len = int(context_lens[b].item())
+            mask_b = custom_mask_flat[offset:offset + MQ_LEN * kv_len].reshape(MQ_LEN, kv_len)
+            mask_2d[b, :, :kv_len] = mask_b
+            offset += MQ_LEN * kv_len
+
+        context.custom_mask = mask_2d
+
+    def eager_tree_decode_flashinfer_plan(self, input_ids, positions, step, cache_hits):
+        """Prepare tree decode via FlashInfer in eager mode (no CUDA graphs).
+
+        Calls .plan() on self.only_prefill_wrapper with the correct KV page
+        metadata and custom mask so that wrapper.run() works in attention.py.
+        context_lens already includes tokens from previous tree decode steps
+        (set by draft_runner via step_context_lens[depth]).
+        """
+        assert self.is_draft and self.config.draft_async
+        context = get_context()
+
+        K, F = self.config.speculate_k, self.config.async_fan_out
+        MQ_LEN = self.config.MQ_LEN
+        flat_batch_size = input_ids.size(0)
+        B = flat_batch_size // MQ_LEN
+
+        block_tables = context.block_tables
+        context_lens = context.context_lens
+
+        cu_seqlens_q = torch.arange(B + 1, dtype=torch.int32, device=self.device) * MQ_LEN
+
+        context_lens_list = context_lens.tolist()
+        kv_lens = [int(cl) for cl in context_lens_list]
+        page_counts = [(cl + self.block_size - 1) // self.block_size for cl in kv_lens]
+
+        kv_indptr = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        kv_indptr[1:] = torch.tensor(page_counts, dtype=torch.int32, device=self.device).cumsum(0)
+
+        if B == 1:
+            kv_indices = block_tables[0, :page_counts[0]]
+        else:
+            kv_indices = torch.cat([block_tables[b, :page_counts[b]] for b in range(B)])
+
+        kv_last_page_len = torch.tensor(
+            [cl % self.block_size if cl % self.block_size != 0 else self.block_size
+             for cl in kv_lens],
+            dtype=torch.int32, device=self.device)
+
+        custom_mask_flat = get_custom_mask(
+            self.config, context_lens, step, K, F, B,
+            device=self.device, cache_hits=cache_hits)
+
         self.only_prefill_wrapper.plan(
             cu_seqlens_q,
             kv_indptr,
@@ -586,22 +699,28 @@ class ModelRunner:
             self.hf_config.num_key_value_heads,
             self.hf_config.head_dim,
             self.block_size,
-            custom_mask=custom_mask,
-            q_data_type=self.hf_config.torch_dtype,
-            kv_data_type=self.hf_config.torch_dtype,
+            custom_mask=custom_mask_flat,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
         )
+
+        context.prefill_wrapper = self.only_prefill_wrapper
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True, tree_decode_step: int = -1, cache_hits: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None):
         is_tree_decode = self.is_draft and self.config.draft_async and tree_decode_step >= 0
         is_mq_kp1 = self.config.speculate and not last_only
         spec_and_dec = not is_prefill and self.config.speculate
+        use_sdpa_tree = is_tree_decode and self.config.tree_decode_backend == "sdpa"
+        use_fi_tree_eager = is_tree_decode and self.config.tree_decode_backend == "flashinfer" and self.enforce_eager
 
         assert not (is_prefill and not last_only), "ERROR in run_model: is_prefill and not last_only"
         
-        if is_prefill or self.enforce_eager:
-            if is_tree_decode:
+        if is_prefill or self.enforce_eager or use_sdpa_tree:
+            if use_sdpa_tree:
                 self.eager_tree_decode_plan(input_ids, positions, tree_decode_step, cache_hits)
+            elif use_fi_tree_eager:
+                self.eager_tree_decode_flashinfer_plan(input_ids, positions, tree_decode_step, cache_hits)
             
             if self.config.use_eagle: 
                 if self.is_draft:

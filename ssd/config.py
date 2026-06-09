@@ -39,6 +39,12 @@ class Config:
     d_model_target: int | None = None
     tokenizer_path: str | None = None
 
+    # AMD ROCm: tree decode backend for async speculative decoding.
+    # "flashinfer" — FlashInfer BatchPrefill with CUDA graphs (fast, default).
+    #                Requires the MFMA row-mapping fix in rocm-flashinfer prefill.cuh.
+    # "sdpa"       — PyTorch SDPA with manual KV gathering (always correct, eager only)
+    tree_decode_backend: str = os.environ.get("SSD_TREE_DECODE_BACKEND", "flashinfer")
+
     # Debugging
     verbose: bool = False 
     debug_mode: bool = False 
