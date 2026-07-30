@@ -87,8 +87,8 @@ class Attention(nn.Module):
                 cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
                 o = flash_attn_with_kvcache(q, k_cache, v_cache,
                                         cache_seqlens=cache_seqlens, page_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True,
                                         cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
+                                        softmax_scale=self.scale, causal=True,
                                         )
             else:
                 o = flash_attn_varlen_func(q, k, v,
