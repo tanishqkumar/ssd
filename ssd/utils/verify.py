@@ -18,8 +18,8 @@ def verify(
      - For temp==0: pure argmax‐compare (greedy).
      - For temp>0: softmax + p/q‐ratio acceptance + (re)sampling.
      - IMPORTANT: Only apply ratio acceptance on rows where the draft proposal truly
-       came from q (cache hit in async mode). On cache misses, fall back to greedy
-       acceptance and sample recovery directly from p.
+       came from q (sync, async cache-hit, or async-jit). On cache misses, fall back
+       to greedy acceptance and sample recovery directly from p.
     """
 
     device = logits_p.device
@@ -52,14 +52,14 @@ def verify(
     temps_t = temperatures_target
     temps_q = temperatures_draft
 
-    # Rows eligible for ratio-acceptance must both need ratio (any temp>0)
-    # AND be cache hits (i.e., tokens were actually sampled from q).
+    # Ratio acceptance and residual resampling are only valid where the proposal
+    # is drawn from q.
     base_ratio_rows = ((temps_t > 0) | (temps_q > 0))
-    
-    if jit_speculate:
-        ratio_rows = base_ratio_rows
+    if cache_hits is None or jit_speculate:
+        is_q_proposal = torch.ones_like(base_ratio_rows)
     else:
-        ratio_rows = base_ratio_rows & (cache_hits.to(torch.bool) if cache_hits is not None else torch.zeros_like(base_ratio_rows, dtype=torch.bool))
+        is_q_proposal= cache_hits.to(torch.bool)
+    ratio_rows = base_ratio_rows & is_q_proposal
 
     do_any_ratio = ratio_rows.any().item()
 
